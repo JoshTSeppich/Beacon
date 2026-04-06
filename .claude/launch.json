@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "Hypervisor",
+      "runtimeExecutable": "/opt/homebrew/bin/node",
+      "runtimeArgs": ["/Users/joshuatseppich/Desktop/Beacon/hypervisor/server.js"],
+      "port": 3333
+    },
+    {
+      "name": "Expo Dev Server",
+      "runtimeExecutable": "/opt/homebrew/bin/node",
+      "runtimeArgs": ["/Users/joshuatseppich/Desktop/Beacon/scripts/expo-start.js"],
+      "port": 8081
+    },
+    {
+      "name": "EsoWoof Clone",
+      "runtimeExecutable": "/Users/joshuatseppich/.nvm/versions/node/v20.19.6/bin/node",
+      "runtimeArgs": ["scripts/esowoof-dev.js"],
+      "port": 5174
+    },
+    {
+      "name": "Acoustic Mapper",
+      "runtimeExecutable": "/opt/homebrew/bin/node",
+      "runtimeArgs": ["-e", "const h=require('http'),f=require('fs'),p=require('path');h.createServer((q,r)=>{let fp=p.join('/Users/joshuatseppich/Desktop/Beacon',q.url==='/'?'/acoustic-mapper.html':q.url);f.readFile(fp,(e,d)=>{if(e){r.writeHead(404);r.end('Not found');}else{const ext=p.extname(fp);const ct={'html':'text/html','js':'application/javascript','css':'text/css'}[ext.slice(1)]||'text/plain';r.writeHead(200,{'Content-Type':ct+';charset=utf-8'});r.end(d);}});}).listen(5175,()=>console.log('Server running on http://localhost:5175'))"],
+      "port": 5175
+    }
+  ]
+}

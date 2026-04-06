@@ -1,0 +1,4181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Acoustic Room Mapper</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<script>
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        beacon: '#00f5ff',
+        'beacon-dim': '#007a80',
+        surface: '#111119',
+        'surface-alt': '#1a1a2e',
+        danger: '#ff4444',
+        success: '#44ff88',
+        warn: '#ffaa44',
+      }
+    }
+  }
+};
+</script>
+<style>
+  body { background: #0a0a0f; overflow-x: hidden; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+  canvas { image-rendering: pixelated; }
+</style>
+</head>
+<body class="bg-[#0a0a0f] text-white min-h-screen">
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+const SAMPLE_RATE = 48000;
+const FFT_SIZE = 4096;
+let SPEED_OF_SOUND = 343; // Updated by temperature input
+const HANNING_CACHE = {};
+
+// v2: Exponential Sine Sweep (ESS) configuration
+const ESS_F1 = 500;              // Start frequency (Hz)
+const ESS_F2 = 8000;             // End frequency (Hz)
+const ESS_DURATION_S = 0.100;    // 100ms sweep
+const ESS_ECHO_WINDOW_S = 0.100; // 100ms echo capture after sweep (covers ~17m round-trip)
+const ESS_SWEEP_PERIOD_S = 0.200; // sweep + echo window = 200ms per cycle (NO overlap)
+const ESS_RATE_HZ = 5;           // 1/ESS_SWEEP_PERIOD_S = 5 sweeps per second
+const ESS_BURST_COUNT = 25;      // Total sweeps per scan (~5 seconds)
+const ESS_BURST_DURATION_S = 5.0;// ESS_BURST_COUNT * ESS_SWEEP_PERIOD_S
+const ESS_BANDWIDTH = ESS_F2 - ESS_F1; // 7500 Hz → 2.3cm range resolution
+
+// Delay-rate tracking
+const DELAY_RATE_ASSOCIATION_M = 0.10;  // 10cm gate (balances physics precision vs OS scheduling jitter)
+const DELAY_RATE_MIN_TRACKS = 3;        // Minimum detections to form a track (was 8→4→3; 25 sweeps −3 AGC = 22 usable; 3/22 = 14% detection rate sufficient)
+const DELAY_RATE_MAX_MISS = 3;          // Kill track after N consecutive misses
+
+const AMBIENT_DURATION_S = 2.0;  // Reduced from 3s — only need noise floor
+const MODAL_PEAK_THRESHOLD_DB = 8; // Raised from 6dB per expert review
+
+// Material classification thresholds
+const MATERIAL_CLASSES = {
+  HARD:   { label: 'Hard surface (concrete/glass/metal)', color: '#4488ff' },
+  WOOD:   { label: 'Wood / drywall', color: '#aa8844' },
+  SOFT:   { label: 'Soft / porous (carpet/fabric)', color: '#88aa44' },
+  BODY:   { label: 'Body / upholstered', color: '#ff8844' },
+  UNKNOWN:{ label: 'Unknown material', color: '#888888' },
+};
+
+// Walking mode uses same ESS burst (shorter: 20 sweeps, 1s)
+const WALKING_BURST_COUNT = 10;  // 10 sweeps at 200ms = 2.0s per walking burst
+const WALKING_BURST_INTERVAL_MS = 3000;
+
+// Footstep detection
+const FOOTSTEP_BAND_LOW = 50;   // Hz
+const FOOTSTEP_BAND_HIGH = 300; // Hz
+const FOOTSTEP_ENERGY_MULT = 3.0;
+const FOOTSTEP_MIN_INTERVAL_MS = 300;
+const FOOTSTEP_EMA_ALPHA = 0.05;
+
+// IMU / step detection
+const STEP_THRESHOLD_G = 1.2;
+const DEFAULT_STRIDE_M = 0.7;
+const MIN_STEP_INTERVAL_MS = 300;
+const DRIFT_CORRECTION_RATE = 0.3;
+
+// Coverage grid
+const GRID_RESOLUTION_M = 0.25;
+const GAUSSIAN_SPLAT_RADIUS = 3; // grid cells
+
+// ============================================================
+// MULTI-DEVICE LINK (MDV-T02 through MDV-T09)
+// WebSocket client for phone↔laptop acoustic room mapping
+// ============================================================
+
+class DeviceLink {
+  constructor() {
+    this.ws = null;
+    this.role = null;           // 'emitter' | 'recorder' | null
+    this.roomCode = null;
+    this.deviceCount = 0;
+    this.clockOffset = 0;       // ms: partner_time = local_time + clockOffset
+    this.syncAccuracy = Infinity;
+    this.connected = false;
+    this.onMessage = null;      // callback for app-level messages
+    this.onStateChange = null;  // callback for connection/role changes
+    this._pendingResponses = new Map(); // for request-response patterns
+    this._messageSeq = 0;
+  }
+
+  connect(serverUrl, roomCode) {
+    return new Promise((resolve, reject) => {
+      this.roomCode = roomCode;
+      const url = `${serverUrl}/ws/room/${roomCode}`;
+      try {
+        this.ws = new WebSocket(url);
+      } catch (e) {
+        reject(new Error(`WebSocket connection failed: ${e.message}`));
+        return;
+      }
+
+      this.ws.onopen = () => {
+        this.connected = true;
+        this.onStateChange?.({ connected: true, role: this.role, deviceCount: this.deviceCount });
+        resolve();
+      };
+
+      this.ws.onclose = (e) => {
+        this.connected = false;
+        this.role = null;
+        this.onStateChange?.({ connected: false, role: null, deviceCount: 0, reason: e.reason });
+      };
+
+      this.ws.onerror = () => {
+        reject(new Error('WebSocket connection error'));
+      };
+
+      this.ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          this._handleMessage(msg);
+        } catch (e) {
+          console.warn('DeviceLink: invalid message', e);
+        }
+      };
+    });
+  }
+
+  disconnect() {
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connected = false;
+    this.role = null;
+    this.roomCode = null;
+  }
+
+  send(type, payload) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({
+      type,
+      payload: payload || {},
+      ts: performance.now(),
+      seq: this._messageSeq++,
+    }));
+  }
+
+  // Wait for a specific message type (with timeout)
+  waitForMessage(type, timeoutMs = 5000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this._pendingResponses.delete(type);
+        reject(new Error(`Timeout waiting for ${type}`));
+      }, timeoutMs);
+      this._pendingResponses.set(type, (msg) => {
+        clearTimeout(timer);
+        resolve(msg);
+      });
+    });
+  }
+
+  _handleMessage(msg) {
+    // Server-originated messages
+    if (msg.type === 'room-state') {
+      this.role = msg.role;
+      this.deviceCount = msg.deviceCount;
+      this.onStateChange?.({ connected: true, role: this.role, deviceCount: this.deviceCount, roomCode: msg.roomId });
+      return;
+    }
+    if (msg.type === 'device-joined') {
+      this.deviceCount = msg.deviceCount;
+      this.onStateChange?.({ connected: true, role: this.role, deviceCount: this.deviceCount });
+      return;
+    }
+    if (msg.type === 'device-left') {
+      this.deviceCount = msg.deviceCount;
+      this.onStateChange?.({ connected: true, role: this.role, deviceCount: this.deviceCount });
+      return;
+    }
+
+    // Handle clock sync responses
+    if (msg.type === 'clock-sync-request') {
+      // Respond immediately with our timestamp
+      this.send('clock-sync-response', {
+        t1: msg.payload.t1,
+        t2: performance.now(),
+        t3: performance.now(),
+      });
+      return;
+    }
+
+    // Check for pending response handlers
+    if (this._pendingResponses.has(msg.type)) {
+      const handler = this._pendingResponses.get(msg.type);
+      this._pendingResponses.delete(msg.type);
+      handler(msg);
+      return;
+    }
+
+    // App-level message
+    this.onMessage?.(msg);
+  }
+
+  // MDV-T05: NTP-style clock synchronization
+  async syncClock(numSamples = 10) {
+    const offsets = [];
+    for (let i = 0; i < numSamples; i++) {
+      const t1 = performance.now();
+      this.send('clock-sync-request', { t1 });
+      try {
+        const response = await this.waitForMessage('clock-sync-response', 2000);
+        const t4 = performance.now();
+        const { t1: t1Echo, t2, t3 } = response.payload;
+        const rtt = (t4 - t1) - (t3 - t2);
+        const offset = ((t2 - t1) + (t3 - t4)) / 2;
+        offsets.push({ offset, rtt });
+      } catch (e) {
+        // Timeout — skip this sample
+      }
+      await new Promise(r => setTimeout(r, 100));
+    }
+    if (offsets.length < 3) {
+      throw new Error('Clock sync failed: too few valid samples');
+    }
+    // Use median offset (robust to outliers)
+    offsets.sort((a, b) => a.offset - b.offset);
+    this.clockOffset = offsets[Math.floor(offsets.length / 2)].offset;
+    // Sync accuracy = half of minimum RTT
+    const minRtt = Math.min(...offsets.map(o => o.rtt));
+    this.syncAccuracy = minRtt / 2;
+    return { offset: this.clockOffset, accuracy: this.syncAccuracy };
+  }
+
+  // Convert local time to partner's time domain
+  partnerTime(localTime) { return localTime + this.clockOffset; }
+  localTime(partnerTime) { return partnerTime - this.clockOffset; }
+}
+
+// ============================================================
+// ROOM MODEL (persistent accumulator for progressive mapping)
+// ============================================================
+
+class RoomModel {
+  constructor() {
+    this.observations = [];
+    this.geometry = null;
+    this.coverageGrid = null;
+    this.confidenceGrid = null;
+    this.gridWidth = 0;
+    this.gridHeight = 0;
+    this.gridOffsetX = 0;
+    this.gridOffsetY = 0;
+    this.positionHistory = [];
+    this.footsteps = [];
+    this.landmarks = [];
+    this.currentPosition = { x: 0, y: 0 };
+    this.modalPeaks = [];
+    this.noiseFloor = null;
+    this.totalSteps = 0;
+    this.floorMaterial = null;
+  }
+
+  initializeFromOneShot(results) {
+    this.geometry = results.geometry;
+    this.modalPeaks = results.modalPeaks || [];
+    this.noiseFloor = results.noiseFloor;
+
+    // Collect all reflections from initial scan as first observation
+    const allReflections = results.responses.flatMap(r => r.reflections);
+    this.observations.push({
+      position: { x: 0, y: 0 },
+      reflections: allReflections,
+      timestamp: Date.now(),
+      confidence: 1.0,
+    });
+
+    // Initialize coverage grid based on room dimensions
+    if (this.geometry.x && this.geometry.y) {
+      this._initGrid(this.geometry.x, this.geometry.y);
+      this.updateCoverageGrid({ x: 0, y: 0 }, allReflections);
+    }
+
+    // Set phone position as origin
+    this.positionHistory.push({
+      x: 0, y: 0,
+      timestamp: Date.now(),
+      source: 'initial',
+    });
+  }
+
+  _initGrid(roomX, roomY) {
+    // Grid covers the full room with some margin
+    const margin = 1.0;
+    this.gridWidth = Math.ceil((roomX + margin * 2) / GRID_RESOLUTION_M);
+    this.gridHeight = Math.ceil((roomY + margin * 2) / GRID_RESOLUTION_M);
+    this.gridOffsetX = -(this.geometry.phonePosition?.x || roomX / 2) - margin;
+    this.gridOffsetY = -(this.geometry.phonePosition?.y || roomY / 2) - margin;
+    this.coverageGrid = new Float32Array(this.gridWidth * this.gridHeight);
+    this.confidenceGrid = new Float32Array(this.gridWidth * this.gridHeight);
+  }
+
+  addObservation(position, reflections, confidence) {
+    this.observations.push({
+      position: { ...position },
+      reflections,
+      timestamp: Date.now(),
+      confidence: confidence || 0.6,
+    });
+    this.positionHistory.push({
+      ...position,
+      timestamp: Date.now(),
+      source: 'chirp',
+    });
+    this.updateCoverageGrid(position, reflections);
+    this.reSolveGeometry();
+  }
+
+  addFootstep(position, floorMaterial, energy) {
+    this.footsteps.push({
+      position: { ...position },
+      floorMaterial,
+      energy,
+      timestamp: Date.now(),
+    });
+    this.totalSteps++;
+    if (floorMaterial && floorMaterial !== MATERIAL_CLASSES.UNKNOWN) {
+      this.floorMaterial = floorMaterial;
+    }
+  }
+
+  addLandmark(position, wallDistances) {
+    this.landmarks.push({
+      position: { ...position },
+      wallDistances,
+      timestamp: Date.now(),
+    });
+  }
+
+  updateCoverageGrid(position, reflections) {
+    if (!this.coverageGrid) return;
+    // Convert world position to grid coords
+    const gx = Math.round((position.x - this.gridOffsetX) / GRID_RESOLUTION_M);
+    const gy = Math.round((position.y - this.gridOffsetY) / GRID_RESOLUTION_M);
+
+    // Gaussian splat around the observation point
+    const r = GAUSSIAN_SPLAT_RADIUS;
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        const cx = gx + dx, cy = gy + dy;
+        if (cx < 0 || cx >= this.gridWidth || cy < 0 || cy >= this.gridHeight) continue;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist > r) continue;
+        const sigma = r / 2.0; // half-radius as 1-sigma
+        const weight = Math.exp(-dist * dist / (2 * sigma * sigma));
+        const idx = cy * this.gridWidth + cx;
+        this.coverageGrid[idx] = Math.min(1.0, this.coverageGrid[idx] + weight * 0.3);
+        this.confidenceGrid[idx] = Math.min(1.0, this.confidenceGrid[idx] + weight * 0.15);
+      }
+    }
+  }
+
+  getCoveragePercentage() {
+    if (!this.coverageGrid) return 0;
+    let mapped = 0, total = 0;
+    // Only count cells inside the room bounds
+    for (let y = 0; y < this.gridHeight; y++) {
+      for (let x = 0; x < this.gridWidth; x++) {
+        const wx = x * GRID_RESOLUTION_M + this.gridOffsetX;
+        const wy = y * GRID_RESOLUTION_M + this.gridOffsetY;
+        if (this.geometry && this.geometry.x && this.geometry.y) {
+          const px = this.geometry.phonePosition?.x || this.geometry.x / 2;
+          const py = this.geometry.phonePosition?.y || this.geometry.y / 2;
+          if (wx > -px && wx < this.geometry.x - px && wy > -py && wy < this.geometry.y - py) {
+            total++;
+            if (this.coverageGrid[y * this.gridWidth + x] > 0.2) mapped++;
+          }
+        }
+      }
+    }
+    return total > 0 ? (mapped / total) * 100 : 0;
+  }
+
+  reSolveGeometry() {
+    const allReflections = this.observations.flatMap(obs =>
+      obs.reflections.map(r => ({
+        ...r,
+        confidence: obs.confidence,
+      }))
+    );
+    if (allReflections.length > 0) {
+      this.geometry = solveRoomGeometry(allReflections, this.modalPeaks);
+    }
+  }
+
+  getDistanceWalked() {
+    if (this.positionHistory.length < 2) return 0;
+    let dist = 0;
+    for (let i = 1; i < this.positionHistory.length; i++) {
+      const dx = this.positionHistory[i].x - this.positionHistory[i - 1].x;
+      const dy = this.positionHistory[i].y - this.positionHistory[i - 1].y;
+      dist += Math.sqrt(dx * dx + dy * dy);
+    }
+    return dist;
+  }
+}
+
+// ============================================================
+// DSP UTILITIES
+// ============================================================
+
+function getHanningWindow(N) {
+  if (HANNING_CACHE[N]) return HANNING_CACHE[N];
+  const w = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    w[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (N - 1)));
+  }
+  HANNING_CACHE[N] = w;
+  return w;
+}
+
+function nextPow2(n) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+// In-place radix-2 Cooley-Tukey FFT
+function fft(re, im) {
+  const N = re.length;
+  // Bit-reversal permutation
+  for (let i = 1, j = 0; i < N; i++) {
+    let bit = N >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let tmp = re[i]; re[i] = re[j]; re[j] = tmp;
+      tmp = im[i]; im[i] = im[j]; im[j] = tmp;
+    }
+  }
+  // Butterfly
+  for (let len = 2; len <= N; len <<= 1) {
+    const half = len >> 1;
+    const ang = -2 * Math.PI / len;
+    const wRe = Math.cos(ang), wIm = Math.sin(ang);
+    for (let i = 0; i < N; i += len) {
+      let cRe = 1, cIm = 0;
+      for (let j = 0; j < half; j++) {
+        const idx = i + j + half;
+        const tRe = cRe * re[idx] - cIm * im[idx];
+        const tIm = cRe * im[idx] + cIm * re[idx];
+        re[idx] = re[i + j] - tRe;
+        im[idx] = im[i + j] - tIm;
+        re[i + j] += tRe;
+        im[i + j] += tIm;
+        const nRe = cRe * wRe - cIm * wIm;
+        cIm = cRe * wIm + cIm * wRe;
+        cRe = nRe;
+      }
+    }
+  }
+}
+
+function ifft(re, im) {
+  const N = re.length;
+  for (let i = 0; i < N; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < N; i++) { re[i] /= N; im[i] = -im[i] / N; }
+}
+
+function magnitudeSpectrum(re, im) {
+  const N = re.length >> 1;
+  const mag = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    mag[i] = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
+  }
+  return mag;
+}
+
+function computeFFTFrame(samples, windowFn) {
+  const N = samples.length;
+  const padN = nextPow2(N);
+  const re = new Float32Array(padN);
+  const im = new Float32Array(padN);
+  for (let i = 0; i < N; i++) re[i] = samples[i] * windowFn[i];
+  fft(re, im);
+  return { re, im };
+}
+
+// Compute average magnitude spectrum with overlapping windows
+function averageSpectrum(signal, winSize, hopSize) {
+  const win = getHanningWindow(winSize);
+  const padN = nextPow2(winSize);
+  const halfN = padN >> 1;
+  const avg = new Float32Array(halfN);
+  let count = 0;
+  for (let offset = 0; offset + winSize <= signal.length; offset += hopSize) {
+    const frame = signal.slice(offset, offset + winSize);
+    const { re, im } = computeFFTFrame(frame, win);
+    const mag = magnitudeSpectrum(re, im);
+    for (let i = 0; i < halfN; i++) avg[i] += mag[i];
+    count++;
+  }
+  if (count > 0) for (let i = 0; i < halfN; i++) avg[i] /= count;
+  return avg;
+}
+
+// Detect peaks above threshold in spectrum
+function findSpectralPeaks(spectrum, noiseFloor, thresholdDb, sampleRate, fftSize) {
+  const peaks = [];
+  const threshMult = Math.pow(10, thresholdDb / 20);
+  const binWidth = sampleRate / fftSize;
+  for (let i = 2; i < spectrum.length - 2; i++) {
+    const threshold = noiseFloor[i] * threshMult;
+    if (spectrum[i] > threshold &&
+        spectrum[i] > spectrum[i - 1] &&
+        spectrum[i] > spectrum[i + 1] &&
+        spectrum[i] > spectrum[i - 2] &&
+        spectrum[i] > spectrum[i + 2]) {
+      peaks.push({
+        bin: i,
+        frequency: i * binWidth,
+        magnitude: spectrum[i],
+        magnitudeDb: 20 * Math.log10(spectrum[i] + 1e-10),
+      });
+    }
+  }
+  return peaks.sort((a, b) => b.magnitude - a.magnitude);
+}
+
+// Cross-correlation via FFT
+function crossCorrelate(emitted, recorded) {
+  const N = nextPow2(emitted.length + recorded.length - 1);
+  const eRe = new Float32Array(N), eIm = new Float32Array(N);
+  const rRe = new Float32Array(N), rIm = new Float32Array(N);
+  for (let i = 0; i < emitted.length; i++) eRe[i] = emitted[i];
+  for (let i = 0; i < recorded.length; i++) rRe[i] = recorded[i];
+  fft(eRe, eIm);
+  fft(rRe, rIm);
+  // Conjugate of emitted * recorded
+  const cRe = new Float32Array(N), cIm = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    cRe[i] = eRe[i] * rRe[i] + eIm[i] * rIm[i]; // conj(E) * R
+    cIm[i] = eRe[i] * rIm[i] - eIm[i] * rRe[i];
+  }
+  ifft(cRe, cIm);
+  return cRe;
+}
+
+// Find peaks in cross-correlation (limited to valid causal lag range)
+function findCorrelationPeaks(corr, threshold_factor, maxLagSamples) {
+  // Only search valid lag range [0, maxLag) to avoid circular aliasing
+  const searchEnd = maxLagSamples || Math.min(corr.length >> 1, corr.length);
+  // Compute RMS only in the valid region for a meaningful threshold
+  let rms = 0;
+  for (let i = 0; i < searchEnd; i++) rms += corr[i] * corr[i];
+  rms = Math.sqrt(rms / searchEnd);
+  const threshold = rms * (threshold_factor || 3);
+  const peaks = [];
+  for (let i = 2; i < searchEnd - 2; i++) {
+    if (corr[i] > threshold &&
+        corr[i] > corr[i - 2] && corr[i] > corr[i - 1] &&
+        corr[i] > corr[i + 1] && corr[i] > corr[i + 2]) {
+      peaks.push({ index: i, amplitude: corr[i] });
+    }
+  }
+  return peaks.sort((a, b) => b.amplitude - a.amplitude);
+}
+
+// v2: Exponential Sine Sweep (Farina 2000) — 2.3cm resolution, 29dB gain
+const generateExponentialSweep = (f1 = ESS_F1, f2 = ESS_F2, durationS = ESS_DURATION_S, sr = SAMPLE_RATE) => {
+  const N = Math.round(durationS * sr);
+  const sweep = new Float32Array(N);
+  const T = durationS;
+  const lnR = Math.log(f2 / f1);
+  const K = 2 * Math.PI * f1 * T / lnR;
+  const fadeSamples = Math.round(0.002 * sr);
+  for (let i = 0; i < N; i++) {
+    const t = i / sr;
+    sweep[i] = Math.sin(K * (Math.exp(t * lnR / T) - 1));
+  }
+  // Fade-in/out to prevent DAC clicks
+  for (let i = 0; i < fadeSamples && i < N; i++) {
+    sweep[i] *= i / fadeSamples;
+    sweep[N - 1 - i] *= i / fadeSamples;
+  }
+  return sweep; // amplitude 1.0 (max volume)
+};
+
+// Inverse filter for ESS deconvolution
+const generateInverseFilter = (sweep, f1 = ESS_F1, f2 = ESS_F2, durationS = ESS_DURATION_S, sr = SAMPLE_RATE) => {
+  const N = sweep.length;
+  const lnR = Math.log(f2 / f1);
+  const inv = new Float32Array(N);
+  for (let i = 0; i < N; i++) {
+    const j = N - 1 - i;
+    inv[i] = sweep[j] * Math.exp(-j * lnR / (sr * durationS));
+  }
+  let maxAbs = 0;
+  for (let i = 0; i < N; i++) { const a = Math.abs(inv[i]); if (a > maxAbs) maxAbs = a; }
+  if (maxAbs > 0) { const scale = 1.0 / (maxAbs * N); for (let i = 0; i < N; i++) inv[i] *= scale; }
+  return inv;
+};
+
+// Deconvolve recorded signal with inverse filter to get Room Impulse Response
+const deconvolveImpulseResponse = (recorded, inverseFilter) => {
+  const linLen = recorded.length + inverseFilter.length - 1;
+  const fftN = nextPow2(linLen);
+  const recRe = new Float32Array(fftN), recIm = new Float32Array(fftN);
+  const invRe = new Float32Array(fftN), invIm = new Float32Array(fftN);
+  for (let i = 0; i < recorded.length; i++) recRe[i] = recorded[i];
+  for (let i = 0; i < inverseFilter.length; i++) invRe[i] = inverseFilter[i];
+  fft(recRe, recIm); fft(invRe, invIm);
+  const outRe = new Float32Array(fftN), outIm = new Float32Array(fftN);
+  for (let i = 0; i < fftN; i++) {
+    outRe[i] = recRe[i] * invRe[i] - recIm[i] * invIm[i];
+    outIm[i] = recRe[i] * invIm[i] + recIm[i] * invRe[i];
+  }
+  ifft(outRe, outIm);
+  return outRe.slice(0, linLen);
+};
+
+// Extract echo peaks with parabolic sub-sample interpolation (~0.36mm precision)
+const extractEchoPeaks = (rir, latencySamples, sr, thresholdFactor, maxLagSamples) => {
+  const endIdx = maxLagSamples || Math.floor(rir.length / 2);
+  // Skip the direct-path spike region for noise floor estimate (start a few ms after latency)
+  const rmsStart = Math.min(latencySamples + Math.round(0.005 * sr), endIdx); // skip 5ms past latency
+  // Use a robust noise floor: 75th-percentile of absolute values in the search window.
+  // Plain RMS is dominated by strong early reflections (e.g. floor echo at -10 dB),
+  // which inflates the threshold enough to bury weaker far-wall echoes (-25 dB).
+  // The 75th-percentile is insensitive to the sparse high-amplitude peaks we are
+  // trying to detect, so the threshold scales with the true noise floor instead.
+  const winCount = endIdx - rmsStart;
+  let noiseFloor = 0;
+  if (winCount > 0) {
+    const absVals = new Float32Array(winCount);
+    for (let i = 0; i < winCount; i++) absVals[i] = Math.abs(rir[rmsStart + i]);
+    absVals.sort();
+    noiseFloor = absVals[Math.floor(winCount * 0.75)];
+  }
+  const threshold = noiseFloor * (thresholdFactor || 10);
+  const peaks = [];
+  for (let i = latencySamples + 2; i < endIdx - 2; i++) {
+    const val = Math.abs(rir[i]);
+    if (val > threshold &&
+        val > Math.abs(rir[i-2]) && val > Math.abs(rir[i-1]) &&
+        val > Math.abs(rir[i+1]) && val > Math.abs(rir[i+2])) {
+      // Parabolic interpolation on signed values (not abs) to preserve peak shape
+      const a = rir[i-1], b = rir[i], c = rir[i+1];
+      const denom = a - 2*b + c;
+      const rawOffset = denom !== 0 ? 0.5*(a-c)/denom : 0;
+      const offset = Math.max(-0.5, Math.min(0.5, rawOffset)); // clamp to valid range
+      const refinedIndex = i + offset;
+      const timeSec = (refinedIndex - latencySamples) / sr;
+      const distance = timeSec * SPEED_OF_SOUND / 2;
+      if (distance > 0.30 && distance < 20) { // 30cm min: chassis ringing masks closer echoes
+        peaks.push({ sampleIndex: i, refinedIndex, amplitude: val, timeSec, distance }); // use abs value, not signed
+      }
+    }
+  }
+  return peaks.sort((a, b) => b.amplitude - a.amplitude);
+};
+
+// Estimate RT60 from RIR via Schroeder backward integration
+// Skip direct-path energy: start integration after the mixing time (~15ms)
+const estimateRT60FromRIR = (rir, sr, directPathIdx) => {
+  const N = rir.length;
+  // Skip past the direct-path spike + 5ms mixing time
+  const skipSamples = (directPathIdx || Math.round(0.015 * sr)) + Math.round(0.005 * sr);
+  if (skipSamples >= N) return null;
+  // Backward integration starting from the reverberant tail only
+  const E = new Float32Array(N);
+  E[N-1] = rir[N-1]*rir[N-1];
+  for (let i = N-2; i >= skipSamples; i--) E[i] = E[i+1] + rir[i]*rir[i];
+  const E0 = E[skipSamples]; // normalize to reverberant energy, not total
+  if (E0 < 1e-20) return null;
+  let idx5 = -1, idx15 = -1;
+  for (let i = skipSamples; i < N-1; i++) {
+    const edB = 10 * Math.log10(E[i]/E0 + 1e-10);
+    const edBnext = 10 * Math.log10(E[i+1]/E0 + 1e-10);
+    if (idx5 === -1 && edB >= -5 && edBnext < -5) idx5 = i + (-5-edB)/(edBnext-edB);
+    if (idx15 === -1 && edB >= -15 && edBnext < -15) idx15 = i + (-15-edB)/(edBnext-edB);
+    if (idx5 !== -1 && idx15 !== -1) break;
+  }
+  if (idx5 === -1 || idx15 === -1 || idx15 <= idx5) return null;
+  return 6 * (idx15 - idx5) / sr;
+};
+
+// Legacy wrapper: generateChirp for backward compatibility with footstep/material code
+function generateChirp(centerFreq, bandwidth, durationS, sr) {
+  return generateExponentialSweep(
+    centerFreq - bandwidth/2, centerFreq + bandwidth/2, durationS, sr
+  );
+}
+
+// Spectral subtraction: remove noise floor from signal
+function spectralSubtract(signal, noiseFloor, winSize, hopSize) {
+  const win = getHanningWindow(winSize);
+  const padN = nextPow2(winSize);
+  const output = new Float32Array(signal.length);
+  const norm = new Float32Array(signal.length);
+
+  for (let offset = 0; offset + winSize <= signal.length; offset += hopSize) {
+    const re = new Float32Array(padN);
+    const im = new Float32Array(padN);
+    for (let i = 0; i < winSize; i++) re[i] = signal[offset + i] * win[i];
+    fft(re, im);
+
+    // Subtract noise magnitude, preserve phase (positive freqs + restore conjugate symmetry)
+    const halfN = padN >> 1;
+    for (let i = 0; i <= halfN; i++) {
+      const mag = Math.sqrt(re[i] * re[i] + im[i] * im[i]);
+      const phase = Math.atan2(im[i], re[i]);
+      const nf = i < noiseFloor.length ? Math.max(noiseFloor[i], 1e-9) : 0;
+      const cleanMag = Math.max(0, mag - nf * 1.5);
+      re[i] = cleanMag * Math.cos(phase);
+      im[i] = cleanMag * Math.sin(phase);
+    }
+    // Restore conjugate symmetry for real-valued IFFT output
+    for (let i = 1; i < halfN; i++) {
+      re[padN - i] = re[i];
+      im[padN - i] = -im[i];
+    }
+
+    ifft(re, im);
+    // OLA synthesis: no double-windowing, normalize by analysis window sum
+    for (let i = 0; i < winSize; i++) {
+      output[offset + i] += re[i];
+      norm[offset + i] += win[i];
+    }
+  }
+
+  for (let i = 0; i < output.length; i++) {
+    if (norm[i] > 1e-8) output[i] /= norm[i];
+  }
+  return output;
+}
+
+// Classify material from spectral reflection shape
+function classifyMaterial(emittedSpectrum, reflectedSpectrum) {
+  if (!emittedSpectrum || !reflectedSpectrum) return MATERIAL_CLASSES.UNKNOWN;
+  const len = Math.min(emittedSpectrum.length, reflectedSpectrum.length);
+  const halfLen = len >> 1;
+
+  let lowBandRatio = 0, highBandRatio = 0;
+  let lowCount = 0, highCount = 0;
+
+  for (let i = 1; i < halfLen; i++) {
+    const ratio = (reflectedSpectrum[i] + 1e-10) / (emittedSpectrum[i] + 1e-10);
+    if (i < halfLen * 0.3) { lowBandRatio += ratio; lowCount++; }
+    else { highBandRatio += ratio; highCount++; }
+  }
+
+  lowBandRatio /= (lowCount || 1);
+  highBandRatio /= (highCount || 1);
+
+  const rolloff = highBandRatio / (lowBandRatio + 1e-10);
+
+  if (rolloff > 0.8) return MATERIAL_CLASSES.HARD;
+  if (rolloff > 0.5 && lowBandRatio > 0.3) return MATERIAL_CLASSES.WOOD;
+  if (rolloff < 0.2 && lowBandRatio < 0.3) return MATERIAL_CLASSES.BODY;
+  if (rolloff < 0.4) return MATERIAL_CLASSES.SOFT;
+  return MATERIAL_CLASSES.WOOD;
+}
+
+// Classify floor material from footstep impact spectrum
+function classifyFloorFromImpact(impactSpectrum, sampleRate) {
+  // NOTE: Wall-echo material classification (classifyMaterial) is unreliable because
+  // speaker+mic frequency response dominates the spectral rolloff. Floor impact classification
+  // is more reliable because it operates in the 50-300Hz band where phone mics are flat.
+  if (!impactSpectrum || impactSpectrum.length < 10) return MATERIAL_CLASSES.UNKNOWN;
+  const sr = sampleRate || SAMPLE_RATE;
+  const fftSize = impactSpectrum.length * 2; // spectrum is half of padN
+  const binHz = sr / fftSize;
+
+  // Restrict analysis to the footstep band (50-300Hz) where signal actually exists
+  const binLow = Math.max(1, Math.round(FOOTSTEP_BAND_LOW / binHz));
+  const binHigh = Math.min(impactSpectrum.length - 1, Math.round(FOOTSTEP_BAND_HIGH / binHz));
+  const bandWidth = binHigh - binLow;
+  if (bandWidth < 3) return MATERIAL_CLASSES.UNKNOWN;
+
+  // Split the 50-300Hz band into three equal sub-bands
+  const third = Math.floor(bandWidth / 3);
+  let lowEnergy = 0, midEnergy = 0, highEnergy = 0;
+  for (let i = binLow; i < binLow + third; i++) lowEnergy += impactSpectrum[i];
+  for (let i = binLow + third; i < binLow + third * 2; i++) midEnergy += impactSpectrum[i];
+  for (let i = binLow + third * 2; i < binHigh; i++) highEnergy += impactSpectrum[i];
+
+  lowEnergy /= third || 1;
+  midEnergy /= third || 1;
+  highEnergy /= (binHigh - binLow - third * 2) || 1;
+
+  const totalEnergy = lowEnergy + midEnergy + highEnergy + 1e-10;
+  const lowRatio = lowEnergy / totalEnergy;
+  const highRatio = highEnergy / totalEnergy;
+
+  // Hard floors (tile, concrete): energy distributed across full band
+  if (highRatio > 0.25 && lowRatio < 0.5) return MATERIAL_CLASSES.HARD;
+  // Wood floors: resonant mid-range from subfloor cavity
+  if (midEnergy > lowEnergy * 0.5 && highRatio > 0.15) return MATERIAL_CLASSES.WOOD;
+  // Carpet/soft: dominated by lowest frequencies, steep rolloff
+  if (lowRatio > 0.6 && highRatio < 0.1) return MATERIAL_CLASSES.SOFT;
+  return MATERIAL_CLASSES.WOOD;
+}
+
+// Room mode frequency for rectangular room
+function roomModeFreq(nx, ny, nz, lx, ly, lz) {
+  return (SPEED_OF_SOUND / 2) * Math.sqrt(
+    (nx / lx) ** 2 + (ny / ly) ** 2 + (nz / lz) ** 2
+  );
+}
+
+// ============================================================
+// v2: DELAY-RATE TRACKING + LEAST-SQUARES GEOMETRY SOLVER
+// ============================================================
+
+let _trackIdCounter = 0;
+
+// Linear regression for delay-rate estimation
+function linearRegression(xs, ys) {
+  const N = xs.length;
+  let sX = 0, sY = 0, sXY = 0, sX2 = 0, sY2 = 0;
+  for (let i = 0; i < N; i++) {
+    sX += xs[i]; sY += ys[i]; sXY += xs[i]*ys[i]; sX2 += xs[i]*xs[i]; sY2 += ys[i]*ys[i];
+  }
+  const denom = N*sX2 - sX*sX;
+  const slope = denom !== 0 ? (N*sXY - sX*sY) / denom : 0;
+  const intercept = (sY - slope*sX) / N;
+  const r2D = denom * (N*sY2 - sY*sY);
+  const r2 = r2D !== 0 ? (N*sXY - sX*sY)**2 / r2D : 0;
+  return { slope, intercept, r2 };
+}
+
+// Predict next echo distance for a track
+function predictNextDistance(track, nextTime) {
+  const d = track.detections;
+  if (d.length >= 2) {
+    const p = d[d.length-2], l = d[d.length-1];
+    const dt = l.time - p.time;
+    const vel = dt !== 0 ? (l.distance - p.distance) / dt : 0;
+    return l.distance + vel * (nextTime - l.time);
+  }
+  return d[d.length-1].distance;
+}
+
+// Track echoes across consecutive sweeps to extract delay-rates
+function trackDelayRates(echoHistory, sweepTimestamps) {
+  let activeTracks = [];
+  for (let si = 0; si < echoHistory.length; si++) {
+    const t = sweepTimestamps[si];
+    const peaks = (echoHistory[si] || []).map((p, i) => ({ idx: i, distance: p.distance, amplitude: p.amplitude, time: t }));
+    const predictions = activeTracks.map(tr => predictNextDistance(tr, t));
+    const matched = new Set();
+    for (let ti = 0; ti < activeTracks.length; ti++) {
+      if (!activeTracks[ti].alive) continue;
+      let bestCost = Infinity, bestDi = -1;
+      for (let di = 0; di < peaks.length; di++) {
+        if (matched.has(di)) continue;
+        const cost = Math.abs(predictions[ti] - peaks[di].distance);
+        if (cost < bestCost) { bestCost = cost; bestDi = di; }
+      }
+      if (bestDi !== -1 && bestCost <= DELAY_RATE_ASSOCIATION_M) {
+        activeTracks[ti].detections.push({ sweepIdx: si, ...peaks[bestDi] });
+        activeTracks[ti].missCount = 0;
+        matched.add(bestDi);
+      } else {
+        activeTracks[ti].missCount++;
+        if (activeTracks[ti].missCount > DELAY_RATE_MAX_MISS) activeTracks[ti].alive = false;
+      }
+    }
+    for (let di = 0; di < peaks.length; di++) {
+      if (!matched.has(di)) {
+        activeTracks.push({ id: _trackIdCounter++, detections: [{ sweepIdx: si, ...peaks[di] }], alive: true, missCount: 0 });
+      }
+    }
+  }
+  const results = [];
+  for (const track of activeTracks) {
+    if (track.detections.length < DELAY_RATE_MIN_TRACKS) continue;
+    const rawTimes = track.detections.map(d => d.time);
+    const t0 = rawTimes[0]; // center times to avoid catastrophic cancellation
+    const times = rawTimes.map(t => t - t0);
+    const delays = track.detections.map(d => 2 * d.distance / SPEED_OF_SOUND);
+    const { slope: delayRate } = linearRegression(times, delays);
+    const meanDistance = track.detections.reduce((s, d) => s + d.distance, 0) / track.detections.length;
+    results.push({ id: track.id, detections: track.detections, delayRate, meanDistance, detectionCount: track.detections.length, surfaceNormal: null });
+  }
+  return results;
+}
+
+// Solve 3x3 linear system via Cramer's rule
+const solve3x3 = (A, b) => {
+  const det3 = (m) => m[0]*(m[4]*m[8]-m[5]*m[7]) - m[1]*(m[3]*m[8]-m[5]*m[6]) + m[2]*(m[3]*m[7]-m[4]*m[6]);
+  const detA = det3(A);
+  if (Math.abs(detA) < 1e-10) return null;
+  const inv = 1/detA;
+  return [
+    det3([b[0],A[1],A[2], b[1],A[4],A[5], b[2],A[7],A[8]]) * inv,
+    det3([A[0],b[0],A[2], A[3],b[1],A[5], A[6],b[2],A[8]]) * inv,
+    det3([A[0],A[1],b[0], A[3],A[4],b[1], A[6],A[7],b[2]]) * inv,
+  ];
+};
+
+// Gaussian elimination with partial pivoting for NxN
+const gaussianElimination = (A, b, n) => {
+  A = A.map(r => r.slice()); b = b.slice();
+  for (let col = 0; col < n; col++) {
+    let pivotRow = col, pivotVal = Math.abs(A[col][col]);
+    for (let row = col+1; row < n; row++) {
+      const v = Math.abs(A[row][col]);
+      if (v > pivotVal) { pivotVal = v; pivotRow = row; }
+    }
+    if (pivotVal < 1e-12) return null;
+    if (pivotRow !== col) { [A[col],A[pivotRow]] = [A[pivotRow],A[col]]; [b[col],b[pivotRow]] = [b[pivotRow],b[col]]; }
+    const pivot = A[col][col];
+    for (let row = col+1; row < n; row++) {
+      const f = A[row][col]/pivot;
+      for (let k = col; k < n; k++) A[row][k] -= f*A[col][k];
+      b[row] -= f*b[col];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let row = n-1; row >= 0; row--) {
+    let sum = b[row];
+    for (let k = row+1; k < n; k++) sum -= A[row][k]*x[k];
+    x[row] = sum / A[row][row];
+  }
+  return x;
+};
+
+// Estimate surface normals from delay-rates + IMU velocity
+function estimateSurfaceNormals(tracks, imuVelocityHistory, sweepTimestamps) {
+  const hasIMU = Array.isArray(imuVelocityHistory) && imuVelocityHistory.length >= 3;
+  if (hasIMU) {
+    for (const track of tracks) {
+      // Per-sweep instantaneous velocity-delay correlation (not averaged delayRate)
+      // This preserves oscillatory tremor information for floor/ceiling disambiguation
+      // v_i · n̂ = -c/2 · Δτ_i/Δt_i for each consecutive detection pair
+      const dets = track.detections;
+      if (dets.length < 4) { track.surfaceNormal = null; continue; }
+      const ATA = new Array(9).fill(0), ATb = new Array(3).fill(0);
+      let validPairs = 0;
+      for (let di = 1; di < dets.length; di++) {
+        const dt = dets[di].time - dets[di-1].time;
+        if (dt < 1e-6) continue;
+        const dDelay = 2 * (dets[di].distance - dets[di-1].distance) / SPEED_OF_SOUND;
+        const instantDelayRate = dDelay / dt;
+        const rhs_i = -SPEED_OF_SOUND / 2 * instantDelayRate;
+        // Find closest IMU velocity sample to this detection time
+        const midTime = (dets[di].time + dets[di-1].time) / 2;
+        let bestV = null, bestDt = Infinity;
+        for (const s of imuVelocityHistory) {
+          const d = Math.abs(s.time - midTime);
+          if (d < bestDt) { bestDt = d; bestV = s; }
+        }
+        if (!bestV || bestDt > 0.5) continue; // skip if no nearby IMU sample
+        const row = [bestV.vx, bestV.vy, bestV.vz];
+        for (let i = 0; i < 3; i++) {
+          ATb[i] += row[i] * rhs_i;
+          for (let j = 0; j < 3; j++) ATA[i*3+j] += row[i] * row[j];
+        }
+        validPairs++;
+      }
+      if (validPairs < 3) { track.surfaceNormal = null; continue; }
+      const n = solve3x3(ATA, ATb);
+      if (!n) { track.surfaceNormal = null; continue; }
+      const len = Math.sqrt(n[0]**2+n[1]**2+n[2]**2);
+      track.surfaceNormal = len > 1e-10 ? [n[0]/len, n[1]/len, n[2]/len] : null;
+      track.normalFromIMU = track.surfaceNormal !== null;
+    }
+  } else {
+    // Fallback: no IMU or all delay-rates near zero — use distance-based pairing
+    // Sort by distance, pair nearest+farthest as opposing walls, assign canonical normals
+    const sorted = [...tracks].sort((a,b) => a.meanDistance - b.meanDistance);
+    const axes = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+    // Check if delay-rates are meaningful (any > 1e-6)
+    const hasDelayRateSignal = sorted.some(t => Math.abs(t.delayRate) > 1e-6);
+    if (hasDelayRateSignal) {
+      // Sort by |delayRate| and pair by sign (positive/negative = opposing walls)
+      const bySorted = [...tracks].sort((a,b) => Math.abs(b.delayRate) - Math.abs(a.delayRate));
+      let ni = 0;
+      for (const t of bySorted) {
+        t.surfaceNormal = axes[ni % 6].slice();
+        t.normalFromIMU = false;
+        ni++;
+      }
+    } else {
+      // All delay-rates ~0 (stationary phone): assign normals by distance order
+      // Shortest pair = height (floor/ceiling), then remaining by ascending distance
+      // This is a heuristic — surfaces closer together are more likely to be opposing walls on the same axis
+      for (let i = 0; i < sorted.length && i < 6; i++) {
+        sorted[i].surfaceNormal = axes[i].slice();
+        sorted[i].normalFromIMU = false;
+      }
+    }
+    // Tracks that didn't receive a normal in the fallback path
+    for (const t of tracks) {
+      if (t.normalFromIMU === undefined) t.normalFromIMU = false;
+    }
+  }
+}
+
+// Pair tracks into opposing walls for room dimensions
+function pairTracksIntoAxes(tracks) {
+  const dot = (a,b) => a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const withN = tracks.filter(t => t.surfaceNormal);
+  const candidates = [];
+  for (let i = 0; i < withN.length; i++)
+    for (let j = i+1; j < withN.length; j++) {
+      const d = dot(withN[i].surfaceNormal, withN[j].surfaceNormal);
+      candidates.push({ i, j, score: Math.abs(d+1) });
+    }
+  candidates.sort((a,b) => a.score-b.score);
+  const used = new Set(), pairs = [];
+  for (const c of candidates) {
+    if (used.has(c.i) || used.has(c.j)) continue;
+    used.add(c.i); used.add(c.j);
+    const tA = withN[c.i], tB = withN[c.j];
+    const n = tA.surfaceNormal, absN = n.map(Math.abs), mx = Math.max(...absN);
+    const axis = mx === absN[0] ? 'x' : mx === absN[1] ? 'y' : 'z';
+    pairs.push({ trackA: tA, trackB: tB, dimension: tA.meanDistance+tB.meanDistance, near: Math.min(tA.meanDistance,tB.meanDistance), far: Math.max(tA.meanDistance,tB.meanDistance), axis });
+  }
+  return pairs;
+}
+
+// v2 Room geometry solver: Gauss-Newton on 6-parameter state [Lx,Ly,Lz,px,py,pz]
+// Heading removed — unobservable from wall distances (CRLB analysis confirms σ=∞)
+function solveGeometryFromDelayRates(tracks, modalPeaks) {
+  // Guard: need at least 4 tracks for a meaningful solve (2 pairs = 2 dimensions minimum)
+  if (!tracks || tracks.length < 4) {
+    return {
+      x: null, y: null, z: null,
+      confidence: { x: 0, y: 0, z: 0 },
+      walls: [], phonePosition: { x: null, y: null, z: null },
+      objects: [], predictedModes: [], detectedModes: [],
+      modalAgreement: 0, surfaceNormals: [], rt60: null,
+      insufficientData: true,
+    };
+  }
+  const pairs = pairTracksIntoAxes(tracks);
+  const sorted = [...pairs].sort((a,b) => a.dimension-b.dimension);
+  let hIdx = -1, bestS = Infinity;
+  for (let i = 0; i < sorted.length; i++) {
+    const d = sorted[i].dimension;
+    const s = d >= 2.0 && d <= 4.0 ? 0 : Math.min(Math.abs(d-2),Math.abs(d-4));
+    if (s < bestS) { bestS = s; hIdx = i; }
+  }
+  const rem = sorted.filter((_,i) => i !== hIdx).sort((a,b) => a.dimension-b.dimension);
+  const pZ = hIdx >= 0 ? sorted[hIdx] : null, pX = rem[0], pY = rem[1];
+  // 6-parameter state: [Lx, Ly, Lz, px, py, pz] — heading removed (unobservable)
+  let state = [pX?.dimension||4, pY?.dimension||5, pZ?.dimension||2.8, pX?.near||2, pY?.near||2.5, pZ?.near||1];
+
+  // Build wall constraints from tracks with normals
+  const walls = tracks.filter(t => t.surfaceNormal).map(t => {
+    const n = t.surfaceNormal, absN = n.map(Math.abs), mx = Math.max(...absN);
+    return { axis: mx===absN[0]?0:mx===absN[1]?1:2, sign: n[mx===absN[0]?0:mx===absN[1]?1:2]>=0?1:-1, observed: t.meanDistance };
+  });
+
+  // Guard: if no wall constraints, return insufficient data instead of fabricated defaults
+  if (walls.length === 0 && (!modalPeaks || modalPeaks.length === 0)) {
+    return {
+      x: null, y: null, z: null,
+      confidence: { x: 0, y: 0, z: 0 },
+      walls: [], phonePosition: { x: null, y: null, z: null },
+      objects: [], predictedModes: [], detectedModes: [],
+      modalAgreement: 0, surfaceNormals: [], rt60: null,
+      insufficientData: true,
+    };
+  }
+
+  let solverFailed = false, solverRanIterations = false;
+  for (let iter = 0; iter < 200; iter++) {
+    const [Lx,Ly,Lz,px,py,pz] = state;
+    const residuals = [], J = [];
+    for (const w of walls) {
+      let pred, dL = [0,0,0], dp = [0,0,0];
+      if (w.sign === 1) { pred = [Lx-px,Ly-py,Lz-pz][w.axis]; dL[w.axis]=1; dp[w.axis]=-1; }
+      else { pred = [px,py,pz][w.axis]; dp[w.axis]=1; }
+      residuals.push(w.observed - pred);
+      J.push([-dL[0],-dL[1],-dL[2],-dp[0],-dp[1],-dp[2]]);
+    }
+    if (modalPeaks?.length > 0) {
+      for (const peak of modalPeaks) {
+        let bestF = null, bestTriple = null, bestD = Infinity;
+        for (let nx=0;nx<=2;nx++) for (let ny=0;ny<=2;ny++) for (let nz=0;nz<=2;nz++) {
+          if (nx+ny+nz===0) continue;
+          const f = roomModeFreq(nx,ny,nz,Lx,Ly,Lz);
+          const d = Math.abs(peak.frequency-f);
+          if (d < bestD) { bestD=d; bestF=f; bestTriple=[nx,ny,nz]; }
+        }
+        if (!bestTriple || bestD > 8) continue; // 8Hz tolerance (was 30Hz — 100% false match above 150Hz)
+        // Scale modal residual (Hz) to match wall residual units (metres)
+        // σ_wall ≈ 0.02m, σ_modal ≈ 2Hz → scale factor = 0.02/2 = 0.01
+        residuals.push((peak.frequency - bestF) * 0.01);
+        const [nx,ny,nz] = bestTriple;
+        const tX=(nx/Lx)**2, tY=(ny/Ly)**2, tZ=(nz/Lz)**2, sq=Math.sqrt(tX+tY+tZ);
+        const c2 = SPEED_OF_SOUND/2;
+        // dr/dLx = -df/dLx = +(c/2)*tX/(Lx*sq) since increasing Lx decreases f, making r=f_obs-f_pred larger
+        // Scale modal Jacobian by 0.01 to match residual scaling (Hz→metre equivalent)
+        const ms = 0.01;
+        J.push([sq>1e-12?ms*c2*tX/(Lx*sq):0, sq>1e-12?ms*c2*tY/(Ly*sq):0, sq>1e-12?ms*c2*tZ/(Lz*sq):0, 0,0,0]);
+      }
+    }
+    if (residuals.length === 0) break;
+    const JtJ = Array.from({length:6},()=>new Array(6).fill(0)), Jtr = new Array(6).fill(0);
+    for (let i = 0; i < residuals.length; i++) {
+      for (let a=0;a<6;a++) { Jtr[a]+=J[i][a]*residuals[i]; for (let b=0;b<6;b++) JtJ[a][b]+=J[i][a]*J[i][b]; }
+    }
+    for (let a=0;a<6;a++) JtJ[a][a]+=0.01;
+    const delta = gaussianElimination(JtJ, Jtr, 6);
+    if (!delta) { solverFailed = true; break; }
+    solverRanIterations = true;
+    // Step-size cap: prevent catastrophic overshoot from modal hyperbolic nonlinearity
+    // f=c/(2L) has unbounded Jacobian near L→0; cap max step to 0.3m per iteration
+    const maxStep = 0.3;
+    const maxDelta = Math.max(...delta.map(Math.abs));
+    const stepScale = maxDelta > maxStep ? maxStep / maxDelta : 1;
+    for (let a=0;a<6;a++) state[a] -= stepScale * delta[a];
+    state[0]=Math.max(1,state[0]); state[1]=Math.max(1,state[1]); state[2]=Math.max(1,state[2]);
+    state[3]=Math.max(0.01,Math.min(state[0]-0.01,state[3]));
+    state[4]=Math.max(0.01,Math.min(state[1]-0.01,state[4]));
+    state[5]=Math.max(0.01,Math.min(state[2]-0.01,state[5]));
+    if (Math.max(...delta.map(Math.abs)) < 1e-6) break;
+  }
+  const [Lx,Ly,Lz,px,py,pz] = state;
+  const predicted = [];
+  for (let nx=0;nx<=2;nx++) for (let ny=0;ny<=2;ny++) for (let nz=0;nz<=2;nz++) {
+    if (nx+ny+nz===0) continue;
+    predicted.push(roomModeFreq(nx,ny,nz,Lx,Ly,Lz));
+  }
+  const conf = Math.min(1, 0.3+0.7*Math.min(1,tracks.length/6));
+  return {
+    x: Lx, y: Ly, z: Lz,
+    confidence: { x: conf*(pX?1:0.6), y: conf*(pY?1:0.6), z: conf*(pZ?1:0.6) },
+    walls: tracks.filter(t=>t.surfaceNormal).map(t=>({ distance: t.meanDistance, reflectionCount: t.detectionCount, material: MATERIAL_CLASSES.UNKNOWN, normal: t.surfaceNormal })),
+    phonePosition: { x: px, y: py, z: pz },
+    objects: [],
+    predictedModes: predicted.sort((a,b)=>a-b),
+    detectedModes: (modalPeaks||[]).map(p=>p.frequency),
+    modalAgreement: (() => {
+      if (!modalPeaks?.length || !predicted.length) return null; // null = not computed, not 0%
+      let matches = 0;
+      for (const dp of modalPeaks) {
+        if (predicted.some(pp => Math.abs(dp.frequency - pp) / pp < 0.05)) matches++;
+      }
+      return matches / modalPeaks.length;
+    })(),
+    surfaceNormals: tracks.map(t=>t.surfaceNormal),
+    rt60: null,
+    solverFailed: solverFailed || !solverRanIterations,
+  };
+}
+
+// Legacy wrapper for backward compatibility
+function solveRoomGeometry(reflections, modalPeaks) {
+  // Convert old-style reflections to tracks for the new solver
+  const groups = [];
+  const sorted = [...reflections].sort((a,b) => a.distance-b.distance);
+  for (const ref of sorted) {
+    let found = false;
+    for (const g of groups) {
+      if (Math.abs(g.avgDist-ref.distance) < 0.5) { g.members.push(ref); g.avgDist = g.members.reduce((s,m)=>s+m.distance,0)/g.members.length; found=true; break; }
+    }
+    if (!found) groups.push({ avgDist: ref.distance, members: [ref] });
+  }
+  const fakeTracks = groups.filter(g=>g.members.length>=2).map((g,i) => ({
+    id: i, detections: g.members.map(m=>({distance:m.distance, amplitude:1, time:0})),
+    delayRate: 0, meanDistance: g.avgDist, detectionCount: g.members.length, surfaceNormal: null
+  }));
+  // Assign normals by position order (fallback path)
+  estimateSurfaceNormals(fakeTracks, null, []);
+  return solveGeometryFromDelayRates(fakeTracks, modalPeaks);
+}
+
+// __V1_BODY_REMOVED_MARKER__
+// The old v1 solver body and getMajorityMaterial need to be fully removed.
+// Keeping getMajorityMaterial as a standalone function:
+function getMajorityMaterial(members) {
+  const counts = {};
+  for (const m of members) {
+    const label = (m.material || MATERIAL_CLASSES.UNKNOWN).label;
+    counts[label] = (counts[label] || 0) + 1;
+  }
+  let best = MATERIAL_CLASSES.UNKNOWN, bestCount = 0;
+  for (const [label, count] of Object.entries(counts)) {
+    if (count > bestCount) { bestCount = count; best = Object.values(MATERIAL_CLASSES).find(m => m.label === label) || MATERIAL_CLASSES.UNKNOWN; }
+  }
+  return best;
+}
+
+// Compute absolute position fix from wall distances against known room geometry
+function acousticPositionFix(reflections, roomGeometry) {
+  if (!roomGeometry || !roomGeometry.x || !roomGeometry.y) return null;
+  if (!reflections || reflections.length === 0) return null;
+
+  const walls = roomGeometry.walls || [];
+  if (walls.length < 2) return null;
+
+  // Try to match reflection distances to known wall distances
+  const matched = [];
+  for (const ref of reflections) {
+    for (let wi = 0; wi < walls.length; wi++) {
+      if (Math.abs(ref.distance - walls[wi].distance) < 0.3) {
+        matched.push({ wallIndex: wi, distance: ref.distance });
+        break;
+      }
+    }
+  }
+
+  if (matched.length < 2) return null;
+
+  // Simple position estimation:
+  // If we know dimensions and distances to walls, position = distance from near wall
+  // For the first 2 matched walls, compute x and y
+  const roomX = roomGeometry.x;
+  const roomY = roomGeometry.y;
+
+  let posX = null, posY = null;
+
+  // Heuristic: walls are ordered by distance, first pair ≈ x-axis, second pair ≈ y-axis
+  for (const m of matched) {
+    const d = m.distance;
+    if (posX === null && d < roomX) {
+      posX = d - (roomGeometry.phonePosition?.x || roomX / 2);
+    } else if (posY === null && d < roomY) {
+      posY = d - (roomGeometry.phonePosition?.y || roomY / 2);
+    }
+  }
+
+  if (posX !== null && posY !== null) {
+    return { x: posX, y: posY };
+  }
+  return null;
+}
+
+// ============================================================
+// VOICE PROXIMITY ESTIMATOR
+// ============================================================
+
+function estimateVoiceDistance(currentSpectrum, fingerprint, calibrationDistance, roomGeometry) {
+  if (!fingerprint || !currentSpectrum) return null;
+
+  const len = Math.min(currentSpectrum.length, fingerprint.spectrum.length);
+
+  // 1. Amplitude-based distance with reverberant field correction
+  let currentEnergy = 0, fingerprintEnergy = 0;
+  for (let i = 0; i < len; i++) {
+    currentEnergy += currentSpectrum[i] * currentSpectrum[i];
+    fingerprintEnergy += fingerprint.spectrum[i] * fingerprint.spectrum[i];
+  }
+  const energyRatio = Math.sqrt(fingerprintEnergy / (currentEnergy + 1e-10));
+
+  // Compute proper critical distance using RT60 from interference measurements if available
+  let criticalDistance = calibrationDistance * 2; // fallback
+  if (roomGeometry && roomGeometry.x && roomGeometry.y && roomGeometry.z) {
+    const volume = roomGeometry.x * roomGeometry.y * roomGeometry.z;
+    const surfaceArea = 2 * (
+      roomGeometry.x * roomGeometry.y +
+      roomGeometry.y * roomGeometry.z +
+      roomGeometry.x * roomGeometry.z
+    );
+    // Use measured RT60 if available, else estimate from room size
+    const rt60 = roomGeometry.rt60 || (0.161 * volume / (surfaceArea * 0.15)); // assume alpha≈0.15
+    const alpha = Math.min(0.95, 0.161 * volume / (surfaceArea * rt60));
+    const R = surfaceArea * alpha / (1 - alpha); // Sabine room constant
+    criticalDistance = 0.057 * Math.sqrt(2 * R); // Q=2 for human voice directivity (was Q=1, underestimating by ~40%)
+  }
+
+  // Reverberant-field-corrected amplitude distance:
+  // E(r) = E_ref * [(d_cal/r)^2 + (d_cal/d_c)^2] / [1 + (d_cal/d_c)^2]
+  // Solve for r: energyRatio^2 = [(d_cal/r)^2 + k^2] / [1 + k^2] where k = d_cal/d_c
+  const k = calibrationDistance / criticalDistance;
+  const rhs = energyRatio * energyRatio * (1 + k * k) - k * k;
+  const amplitudeDistance = rhs > 0.01
+    ? calibrationDistance / Math.sqrt(rhs)
+    : criticalDistance * 3; // saturated past reverberant field
+
+  // The amplitude model with reverberant-field correction is the sole estimator.
+  // D/R ratio cannot be measured from a single mic's frequency spectrum (would need
+  // time-domain RIR which requires a known excitation signal, not continuous voice).
+  // The amplitude model already incorporates the room's critical distance from RT60.
+  return Math.max(0.1, Math.min(amplitudeDistance, 20));
+}
+
+// ============================================================
+// PASSIVE ACOUSTIC MAPPING: SSSG + DPF
+// Standing Sound Synthesis Gating + dB Proximity Fencing
+// Runs in conjunction with active ESS sweeps during walking mode
+//
+// OPERATING REGIME (from gap research synthesis):
+// - Works reliably in hard-walled rooms (drywall α<0.1, Q=10-20)
+// - Degrades in furnished rooms (carpet/fabric α>0.3, Q<5)
+// - MEMS mic noise floor at 50Hz is ~49 dB SPL (not the 29 dBA spec)
+// - Modal SNR vs mic noise: 13-28 dB depending on Q and HVAC level
+// - Target mode orders n=3-6 (100-200Hz), not n=1-2 (<100Hz, worst SNR)
+// - Walk speed 1.2-1.5 m/s for spatial modulation above HVAC fluctuation (1-12Hz)
+// - Restrict mode extraction to n≤4 where spectral gap >1 octave from HVAC
+// - DPF most reliable anchored to 60Hz/120Hz electrical hum (genuinely stationary)
+// - Adjacent-room leakage through drywall (TL=5-8dB at 50Hz) is a binary failure
+//   mode in drywall-separated apartments; concrete eliminates it
+// - Height axis requires hybrid active emission or barometric altimetry
+// - Step-length uncertainty (±15%) is the dominant error source for dimensions
+// - Use ratio of consecutive spatial frequencies (invariant to step length) when possible
+// ============================================================
+
+// STFT for spatial modulation analysis (100ms window, 10Hz freq resolution)
+const computeSTFT = (signal, windowSize = 4800, hopSize = 2400, sampleRate = SAMPLE_RATE) => {
+  const fftN = nextPow2(windowSize);
+  const win = getHanningWindow(windowSize);
+  const freqBinWidth = sampleRate / fftN;
+  const magnitudes = [], times = [];
+  for (let start = 0; start + windowSize <= signal.length; start += hopSize) {
+    const re = new Float32Array(fftN), im = new Float32Array(fftN);
+    for (let i = 0; i < windowSize; i++) re[i] = signal[start + i] * win[i];
+    fft(re, im);
+    magnitudes.push(magnitudeSpectrum(re, im));
+    times.push((start + windowSize / 2) / sampleRate);
+  }
+  return { magnitudes, times, freqBinWidth };
+};
+
+// Find persistent spectral peaks (room modes) in 20-300Hz band
+const extractModalCandidates = (stft, noiseFloorDB = -60, minFreq = 20, maxFreq = 300) => {
+  const { magnitudes, freqBinWidth } = stft;
+  const nFrames = magnitudes.length, nBins = magnitudes[0].length;
+  const minBin = Math.ceil(minFreq / freqBinWidth);
+  const maxBin = Math.min(Math.floor(maxFreq / freqBinWidth), nBins - 1);
+  const meanMag = new Float32Array(nBins);
+  for (let b = minBin; b <= maxBin; b++) {
+    let sum = 0;
+    for (let k = 0; k < nFrames; k++) sum += magnitudes[k][b];
+    meanMag[b] = sum / nFrames;
+  }
+  const threshold = Math.pow(10, (noiseFloorDB + 8) / 20);
+  const candidates = [];
+  for (let b = minBin; b <= maxBin; b++) {
+    if (meanMag[b] <= threshold) continue;
+    const peakDB = 20 * Math.log10(meanMag[b] + 1e-10);
+    const halfLin = Math.pow(10, (peakDB - 3) / 20);
+    let lo = b, hi = b;
+    while (lo > minBin && meanMag[lo - 1] >= halfLin) lo--;
+    while (hi < maxBin && meanMag[hi + 1] >= halfLin) hi++;
+    const qFactor = b / Math.max(hi - lo, 1);
+    if (qFactor < 2) continue;
+    candidates.push({ frequency: b * freqBinWidth, magnitude: meanMag[b], qFactor, binIndex: b });
+  }
+  return candidates;
+};
+
+// Compute spatial modulation of each mode along the walk trajectory
+const computeSpatialModulation = (stft, positions, modalCandidates) => {
+  const { magnitudes } = stft;
+  const nFrames = Math.min(magnitudes.length, positions.length);
+  if (nFrames < 4) return [];
+  // Minimum walk distance guard: prevent spatial aliasing
+  // Need at least half a spatial wavelength of the lowest-order detectable mode
+  // For mode order n in a room of max dimension ~10m: λ_spatial = 2*L/n = 20m for n=1
+  // Minimum useful walk = λ_spatial/4 = 5m for n=1, 1.25m for n=4
+  // With mode orders 3-6 targeted (60-250Hz band), minimum = ~0.8m
+  const minWalkDistance = 0.8; // metres — covers n≥3 modes for rooms up to 10m
+  const walkSpan = Math.abs(positions[nFrames - 1].x - positions[0].x);
+  if (walkSpan < minWalkDistance) return [];
+  const dxArr = [];
+  for (let k = 1; k < nFrames; k++) {
+    const dx = Math.abs(positions[k].x - positions[k - 1].x);
+    if (dx > 0) dxArr.push(dx);
+  }
+  dxArr.sort((a, b) => a - b);
+  const dxMedian = dxArr[Math.floor(dxArr.length / 2)] || 0.05;
+  // Use min/max of all positions (handles non-monotonic back-and-forth walks)
+  let xMin = Infinity, xMax = -Infinity;
+  for (let k = 0; k < nFrames; k++) {
+    if (positions[k].x < xMin) xMin = positions[k].x;
+    if (positions[k].x > xMax) xMax = positions[k].x;
+  }
+  const xStart = xMin, xEnd = xMax;
+  const xRange = (xMax - xMin) || 1;
+  const nGrid = Math.max(8, nextPow2(Math.round(xRange / dxMedian)));
+  const dxGrid = xRange / nGrid;
+  const results = [];
+  for (const cand of modalCandidates) {
+    const trace = new Float32Array(nFrames);
+    for (let k = 0; k < nFrames; k++) trace[k] = magnitudes[k][cand.binIndex];
+    let mu = 0, sigma = 0;
+    for (let k = 0; k < nFrames; k++) mu += trace[k];
+    mu /= nFrames;
+    for (let k = 0; k < nFrames; k++) sigma += (trace[k] - mu) ** 2;
+    sigma = Math.sqrt(sigma / nFrames) || 1;
+    for (let k = 0; k < nFrames; k++) trace[k] = (trace[k] - mu) / sigma;
+    const gridRe = new Float32Array(nGrid), gridIm = new Float32Array(nGrid);
+    for (let g = 0; g < nGrid; g++) {
+      const xg = xStart + g * dxGrid;
+      let lo = 0, hi = nFrames - 1;
+      for (let k = 0; k < nFrames - 1; k++) {
+        if ((positions[k].x <= xg && positions[k + 1].x >= xg) ||
+            (positions[k].x >= xg && positions[k + 1].x <= xg)) { lo = k; hi = k + 1; break; }
+      }
+      const span = positions[hi].x - positions[lo].x;
+      const t = span !== 0 ? (xg - positions[lo].x) / span : 0;
+      gridRe[g] = trace[lo] + t * (trace[hi] - trace[lo]);
+    }
+    fft(gridRe, gridIm);
+    const dKappa = 1 / (nGrid * dxGrid);
+    const halfN = Math.floor(nGrid / 2);
+    let peakPow = 0, peakBin = 0, totalPow = 0;
+    for (let b = 1; b < halfN; b++) {
+      const pow = gridRe[b] ** 2 + gridIm[b] ** 2;
+      totalPow += pow;
+      if (pow > peakPow) { peakPow = pow; peakBin = b; }
+    }
+    const noisePow = totalPow - peakPow;
+    const spatialSNR = noisePow > 0 ? 10 * Math.log10(peakPow / (noisePow / (halfN - 2) + 1e-30)) : 0;
+    results.push({ frequency: cand.frequency, spatialFrequency: peakBin * dKappa, spatialSNR });
+  }
+  return results;
+};
+
+// Extract room dimensions from spatial modulation harmonic series
+const estimateDimensionsFromSSG = (spatialModulations, speedOfSound = SPEED_OF_SOUND) => {
+  // |cos(nπx/L)| has dominant spatial frequency κ = 2n/L (not n/2L)
+  // So f_n/κ_n = [nc/(2L)] / [2n/L] = c/4, not c/2
+  const quarterC = speedOfSound / 4;
+  const accepted = spatialModulations.filter(m => {
+    if (m.spatialFrequency < 1e-4) return false;
+    const ratio = m.frequency / m.spatialFrequency;
+    return Math.abs(ratio - quarterC) / quarterC < 0.20; // 20% tolerance for |cos| spatial freq
+  });
+  if (accepted.length < 2) return [];
+  accepted.sort((a, b) => a.frequency - b.frequency);
+  const lEstimates = [];
+  for (let i = 0; i < accepted.length - 1; i++) {
+    for (let j = i + 1; j < accepted.length; j++) {
+      const deltaF = accepted[j].frequency - accepted[i].frequency;
+      if (deltaF < 1) continue;
+      const ratio = accepted[i].frequency / deltaF;
+      if (Math.abs(ratio - Math.round(ratio)) / Math.max(Math.round(ratio), 1) < 0.12)
+        lEstimates.push(speedOfSound / (2 * deltaF));
+    }
+  }
+  if (lEstimates.length === 0) return [];
+  lEstimates.sort((a, b) => a - b);
+  const clusters = [];
+  let current = [lEstimates[0]];
+  for (let i = 1; i < lEstimates.length; i++) {
+    const centre = current.reduce((s, v) => s + v, 0) / current.length;
+    if (Math.abs(lEstimates[i] - centre) / centre < 0.10) current.push(lEstimates[i]);
+    else { clusters.push(current); current = [lEstimates[i]]; }
+  }
+  clusters.push(current);
+  return clusters.map(c => {
+    const dim = c.reduce((s, v) => s + v, 0) / c.length;
+    const spread = Math.max(...c) - Math.min(...c);
+    const confidence = Math.min(1, (1 - Math.min(spread / dim, 1)) * Math.sqrt(c.length / accepted.length));
+    return { dimension: dim, confidence, supportingModes: c.length };
+  }).filter(d => d.dimension > 0.5 && d.dimension < 30);
+};
+
+// dB Proximity Fencing — wall distance from frequency-dependent pressure enhancement
+const computeDPFProximity = (stft, positions) => {
+  const { magnitudes, freqBinWidth } = stft;
+  const nFrames = Math.min(magnitudes.length, positions.length);
+  const nBins = magnitudes[0].length;
+  const lBar = new Float32Array(nBins);
+  for (let b = 0; b < nBins; b++) {
+    let sum = 0;
+    for (let k = 0; k < nFrames; k++) sum += magnitudes[k][b];
+    lBar[b] = 20 * Math.log10(sum / nFrames + 1e-10);
+  }
+  const results = [];
+  const minOnsetBin = Math.ceil(30 / freqBinWidth);
+  for (let k = 0; k < nFrames; k++) {
+    // DPF: scan low-to-high. Wall proximity causes enhancement at ALL frequencies
+    // below c/(8d). Find the highest frequency where enhancement is sustained.
+    let fOnsetBin = -1;
+    let consecutiveAbove = 0;
+    for (let b = minOnsetBin; b < Math.min(nBins, 200); b++) { // cap at ~1.2kHz
+      const dL = 20 * Math.log10(magnitudes[k][b] + 1e-10) - lBar[b];
+      if (dL > 3.0) {
+        consecutiveAbove++;
+        fOnsetBin = b; // keep updating — highest sustained bin
+      } else {
+        if (consecutiveAbove >= 2) break; // found the rolloff edge
+        consecutiveAbove = 0;
+        fOnsetBin = -1;
+      }
+    }
+    if (fOnsetBin < minOnsetBin || consecutiveAbove < 2) continue;
+    const fOnset = fOnsetBin * freqBinWidth;
+    const wallDistance = SPEED_OF_SOUND / (4 * fOnset); // d = c/(4f) for quarter-wave pressure node
+    const dL = 20 * Math.log10(magnitudes[k][fOnsetBin] + 1e-10) - lBar[fOnsetBin];
+    const confidence = Math.min(dL / 12, 1) * Math.max(0, 1 - wallDistance / 1.4);
+    results.push({ position: positions[k].x, fOnset, wallDistance, confidence });
+  }
+  return results;
+};
+
+// PassiveAcousticMapper — orchestrates SSSG+DPF pipeline, fuses with active results
+class PassiveAcousticMapper {
+  constructor(sampleRate = SAMPLE_RATE) { this.sampleRate = sampleRate; }
+
+  analyze(audioBuffer, positions, walkHeading = 0) {
+    const cosH = Math.cos(walkHeading);
+    const projected = positions.map(p => ({ x: p.x * cosH }));
+    const stft = computeSTFT(audioBuffer, 4800, 2400, this.sampleRate);
+    // Estimate noise floor from lowest 10% of modal band levels
+    const allLevels = [];
+    const minBin = Math.ceil(20 / stft.freqBinWidth), maxBin = Math.floor(300 / stft.freqBinWidth);
+    for (const frame of stft.magnitudes)
+      for (let b = minBin; b <= maxBin; b++) allLevels.push(frame[b]);
+    allLevels.sort((a, b) => a - b);
+    const nfDB = 20 * Math.log10((allLevels[Math.floor(allLevels.length * 0.1)] || 1e-6) + 1e-10);
+    // Target 60-250Hz: mode orders 3-6 have best SNR vs MEMS noise floor
+    // Below 60Hz: MEMS noise floor ~59dB SPL dominates; above 250Hz: Schroeder freq
+    const modalCandidates = extractModalCandidates(stft, nfDB, 60, 250);
+    const spatialMod = computeSpatialModulation(stft, projected, modalCandidates);
+    const dimensions = estimateDimensionsFromSSG(spatialMod, SPEED_OF_SOUND);
+    const wallProximity = computeDPFProximity(stft, projected).map(({ position, wallDistance }) => ({ position, wallDistance }));
+    return { dimensions, wallProximity, modalCandidates };
+  }
+
+  fuseWithActiveResults(passiveResults, activeGeometry) {
+    if (!passiveResults?.dimensions?.length || !activeGeometry) return activeGeometry;
+    const fused = { ...activeGeometry };
+    const axes = ['x', 'y', 'z'];
+    for (const axis of axes) {
+      const activeDim = activeGeometry[axis];
+      if (!activeDim) continue;
+      const best = passiveResults.dimensions.reduce((acc, pd) => {
+        const err = Math.abs(pd.dimension - activeDim);
+        return err < acc.err ? { dim: pd.dimension, conf: pd.confidence, err } : acc;
+      }, { dim: activeDim, conf: 0, err: Infinity });
+      // Passive SSSG is a weak corroborating signal only (spatial aliasing limits accuracy)
+      // Only accept if very close match (<15%) and high confidence
+      if (best.err / activeDim > 0.15 || best.conf < 0.3) continue;
+      const pw = 0.10 * best.conf; // 10% max weight (down from 30%)
+      fused[axis] = (1.0 - pw) * activeDim + pw * best.dim; // proper convex combination
+    }
+    return fused;
+  }
+}
+
+// ============================================================
+// AUDIO ENGINE
+// ============================================================
+
+class AcousticEngine {
+  constructor() {
+    this.audioCtx = null;
+    this.stream = null;
+    this.latencyMs = 0;
+    this.isRunning = false;
+  }
+
+  async init() {
+    // getUserMedia requires HTTPS or localhost — check for secure context
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error(
+        window.isSecureContext === false
+          ? 'Microphone access requires HTTPS. Please serve this page over HTTPS or open it on localhost.'
+          : 'Your browser does not support microphone access (getUserMedia).'
+      );
+    }
+    this.audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+      sampleRate: SAMPLE_RATE,
+    });
+    // Resume AudioContext if suspended (required by iOS Safari autoplay policy)
+    if (this.audioCtx.state === 'suspended') {
+      await this.audioCtx.resume();
+    }
+    if (this.audioCtx.sampleRate !== SAMPLE_RATE) {
+      console.warn(`Requested ${SAMPLE_RATE}Hz, got ${this.audioCtx.sampleRate}Hz`);
+    }
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        sampleRate: SAMPLE_RATE,
+      },
+    });
+  }
+
+  async calibrateLatency(onProgress) {
+    if (!this.audioCtx || !this.stream) throw new Error('Not initialized');
+    onProgress?.('Calibrating audio latency...');
+
+    // 7 measurements with outlier rejection for robust latency estimation
+    const measurements = [];
+    for (let attempt = 0; attempt < 7; attempt++) {
+      const latency = await this._measureSingleLatency();
+      if (latency > 5 && latency < 300) measurements.push(latency);
+      await this._wait(500); // longer gap to avoid reverb contamination
+    }
+
+    if (measurements.length >= 3) {
+      measurements.sort((a, b) => a - b);
+      const trimmed = measurements.slice(1, -1);
+      this.latencyMs = trimmed[Math.floor(trimmed.length / 2)];
+    } else {
+      this.latencyMs = measurements.length > 0
+        ? measurements.reduce((a, b) => a + b, 0) / measurements.length
+        : 15; // reasonable default for same-device speaker/mic
+    }
+
+    // Log API-reported latency for diagnostics (ScriptProcessor buffering IS part of the
+    // real system delay — the measured value correctly includes it and should NOT be capped)
+    const apiLatencyMs = ((this.audioCtx.outputLatency || 0) + (this.audioCtx.baseLatency || 0)) * 1000;
+    if (apiLatencyMs > 0) {
+      console.log(`Latency cross-check: measured ${this.latencyMs.toFixed(1)}ms, API reports ${apiLatencyMs.toFixed(1)}ms (output+base only, excludes ScriptProcessor buffer)`);
+    }
+
+    onProgress?.(`Latency: ${this.latencyMs.toFixed(1)} ms`);
+    return this.latencyMs;
+  }
+
+  async _measureSingleLatency() {
+    const ctx = this.audioCtx;
+    const dur = 0.005; // 5ms impulse
+    const recDur = 0.15; // record 150ms (longer to catch high-latency devices)
+    const buf = ctx.createBuffer(1, Math.round(dur * ctx.sampleRate), ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    // Short click
+    for (let i = 0; i < data.length; i++) {
+      data[i] = (i < data.length / 2) ? 0.9 : -0.9;
+    }
+
+    const recorded = await this._emitAndRecord(buf, recDur);
+    // Use cross-correlation for sub-buffer-boundary precision
+    const corr = crossCorrelate(data, recorded);
+    // Find the correlation peak with parabolic interpolation
+    let maxVal = 0, maxIdx = 0;
+    for (let i = 0; i < Math.min(corr.length, recorded.length); i++) {
+      if (Math.abs(corr[i]) > maxVal) {
+        maxVal = Math.abs(corr[i]);
+        maxIdx = i;
+      }
+    }
+    if (maxVal < 0.001) return -1; // too quiet
+    // Parabolic sub-sample interpolation for sub-buffer-boundary precision
+    let refinedIdx = maxIdx;
+    if (maxIdx > 0 && maxIdx < corr.length - 1) {
+      const a = corr[maxIdx - 1], b = corr[maxIdx], c = corr[maxIdx + 1];
+      const denom = a - 2 * b + c;
+      if (denom !== 0) {
+        const offset = Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / denom));
+        refinedIdx = maxIdx + offset;
+      }
+    }
+    return (refinedIdx / ctx.sampleRate) * 1000;
+  }
+
+  async _emitAndRecord(audioBuffer, recordDurationS) {
+    const ctx = this.audioCtx;
+    const totalSamples = Math.round(recordDurationS * ctx.sampleRate);
+    const recorded = new Float32Array(totalSamples);
+    let writeIdx = 0;
+
+    return new Promise((resolve, reject) => {
+      const source = ctx.createMediaStreamSource(this.stream);
+      const processor = ctx.createScriptProcessor(2048, 1, 1);
+      let settled = false;
+
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        try { processor.disconnect(); } catch (_) {}
+        try { source.disconnect(); } catch (_) {}
+      };
+
+      // Timeout: reject if recording doesn't complete in 2x expected duration
+      const timeoutMs = Math.max(recordDurationS * 2000 + 2000, 5000);
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(recorded); // return partial recording rather than hanging
+      }, timeoutMs);
+
+      processor.onaudioprocess = (e) => {
+        if (settled) return;
+        const input = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < input.length && writeIdx < totalSamples; i++) {
+          recorded[writeIdx++] = input[i];
+        }
+        if (writeIdx >= totalSamples) {
+          clearTimeout(timer);
+          cleanup();
+          resolve(recorded);
+        }
+      };
+      source.connect(processor);
+      // Connect to a silent sink (gain=0) to keep ScriptProcessor alive
+      // WITHOUT routing mic audio back to the speaker (prevents feedback loop)
+      const silentSink = ctx.createGain();
+      silentSink.gain.value = 0;
+      processor.connect(silentSink);
+      // Must connect to destination for ScriptProcessor to fire callbacks in Chrome
+      // gain=0 prevents audible output; the graph-level feedback is attenuated to zero
+      silentSink.connect(ctx.destination);
+
+      // Play the buffer
+      const player = ctx.createBufferSource();
+      player.buffer = audioBuffer;
+      player.connect(ctx.destination);
+      player.start();
+    });
+  }
+
+  async recordAmbient(durationS, onProgress, onWaveform) {
+    onProgress?.('Capturing ambient noise baseline...');
+    const totalSamples = Math.round(durationS * this.audioCtx.sampleRate);
+    const recorded = new Float32Array(totalSamples);
+    let writeIdx = 0;
+
+    return new Promise((resolve) => {
+      const source = this.audioCtx.createMediaStreamSource(this.stream);
+      const processor = this.audioCtx.createScriptProcessor(2048, 1, 1);
+      let settled = false;
+
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        try { processor.disconnect(); } catch (_) {}
+        try { source.disconnect(); } catch (_) {}
+      };
+
+      // Timeout: resolve with partial recording rather than hanging forever
+      // (e.g. if AudioContext is suspended and onaudioprocess never fires)
+      const timeoutMs = Math.max(durationS * 2000 + 2000, 5000);
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve(recorded);
+      }, timeoutMs);
+
+      processor.onaudioprocess = (e) => {
+        if (settled) return;
+        const input = e.inputBuffer.getChannelData(0);
+        for (let i = 0; i < input.length && writeIdx < totalSamples; i++) {
+          recorded[writeIdx++] = input[i];
+        }
+        onWaveform?.(input);
+        if (writeIdx >= totalSamples) {
+          clearTimeout(timer);
+          cleanup();
+          resolve(recorded);
+        }
+      };
+      source.connect(processor);
+      const sink = this.audioCtx.createGain();
+      sink.gain.value = 0;
+      processor.connect(sink);
+      sink.connect(this.audioCtx.destination); // required for ScriptProcessor callbacks in Chrome
+    });
+  }
+
+  // v2: Rapid ESS sweep burst — 40 sweeps at 20Hz for delay-rate tracking
+  async emitSweepBurst(noiseFloor, sweepCount, onProgress, onWaveform) {
+    const count = sweepCount || ESS_BURST_COUNT;
+    const sr = this.audioCtx.sampleRate; // MUST be declared before use
+    const sweep = generateExponentialSweep(ESS_F1, ESS_F2, ESS_DURATION_S, sr);
+    const invFilter = generateInverseFilter(sweep, ESS_F1, ESS_F2, ESS_DURATION_S, sr);
+    const latSamples = Math.round(this.latencyMs * sr / 1000);
+    const echoHistory = [];
+    const sweepTimestamps = [];
+    const responses = []; // backward compat
+    let lastRIR = null;
+    let rirAccumulator = null;
+
+    for (let i = 0; i < count; i++) {
+      const sweepStartTime = performance.now() / 1000; // timestamp BEFORE emit
+      onProgress?.(`Scanning... (${i+1} of ${count})`);
+      const buf = this.audioCtx.createBuffer(1, sweep.length, sr);
+      buf.getChannelData(0).set(sweep);
+      // Include latency margin so echo window isn't truncated on high-latency devices
+      const recDur = ESS_DURATION_S + ESS_ECHO_WINDOW_S + this.latencyMs / 1000;
+      const recording = await this._emitAndRecord(buf, recDur);
+      onWaveform?.(recording.slice(-2048));
+
+      const rir = deconvolveImpulseResponse(recording, invFilter);
+      lastRIR = rir;
+      // Accumulate RIRs for coherent averaging (reduces RT60 variance by √N)
+      if (!rirAccumulator) {
+        rirAccumulator = new Float32Array(rir.length);
+      }
+      for (let j = 0; j < Math.min(rir.length, rirAccumulator.length); j++) {
+        rirAccumulator[j] += rir[j];
+      }
+      // Direct-path peak in deconvolved RIR is at (sweepLength-1) + latencySamples,
+      // NOT at latencySamples — the linear convolution of a signal with its time-reverse
+      // peaks at N-1 samples offset. Search from the direct path onward.
+      const directPathIdx = (sweep.length - 1) + latSamples;
+      const maxSearchIdx = directPathIdx + Math.round(ESS_ECHO_WINDOW_S * sr);
+      const peaks = extractEchoPeaks(rir, directPathIdx, sr, 8, maxSearchIdx);
+
+      echoHistory.push(peaks);
+      sweepTimestamps.push(sweepStartTime); // use pre-emit timestamp for consistent tracking
+
+      // Build backward-compatible response entry
+      if (peaks.length > 0) {
+        const emittedSpec = averageSpectrum(sweep, 512, 256);
+        for (const p of peaks) p.material = MATERIAL_CLASSES.UNKNOWN;
+        responses.push({ chirp: { center: (ESS_F1+ESS_F2)/2, duration: ESS_DURATION_S, bandwidth: ESS_BANDWIDTH }, reflections: peaks, emittedSpectrum: emittedSpec });
+      }
+
+      // Brief pause between sweeps (remaining time in period)
+      const elapsed = performance.now() / 1000 - sweepTimestamps[i];
+      const remaining = ESS_SWEEP_PERIOD_S - elapsed;
+      if (remaining > 0.005) await this._wait(remaining * 1000);
+    }
+
+    // Average the accumulated RIR across all sweeps
+    if (rirAccumulator) {
+      for (let j = 0; j < rirAccumulator.length; j++) rirAccumulator[j] /= count;
+    }
+
+    // Estimate RT60 from averaged RIR (reduces variance by √N vs. single sweep)
+    const lastDirectPathIdx = (sweep.length - 1) + latSamples;
+    const rt60 = rirAccumulator ? estimateRT60FromRIR(rirAccumulator, sr, lastDirectPathIdx) : null;
+
+    return { echoHistory, sweepTimestamps, responses, rt60, sweep, invFilter };
+  }
+
+  // Legacy wrapper for backward compatibility
+  async emitChirpSequence(noiseFloor, onProgress, onWaveform) {
+    const result = await this.emitSweepBurst(noiseFloor, ESS_BURST_COUNT, onProgress, onWaveform);
+    return { responses: result.responses, tailReverb: new Float32Array(0), ...result };
+  }
+
+  // (v1 chirp sequence removed — replaced by emitSweepBurst above)
+
+  async measureInterference(modalPeaks, onProgress) {
+    const results = [];
+    const peaksToTest = modalPeaks.slice(0, 5);
+
+    for (let i = 0; i < peaksToTest.length; i++) {
+      const peak = peaksToTest[i];
+      onProgress?.(`Modal decay test ${i + 1}/${peaksToTest.length}: ${peak.frequency.toFixed(0)} Hz`);
+
+      // Emit a tone burst at the modal frequency, then measure its decay
+      const toneDur = 0.1; // 100ms burst
+      const decayDur = 0.3; // 300ms of decay recording after burst ends
+      const toneLen = Math.round(toneDur * this.audioCtx.sampleRate);
+      const toneBuf = this.audioCtx.createBuffer(1, toneLen, this.audioCtx.sampleRate);
+      const toneData = toneBuf.getChannelData(0);
+      for (let j = 0; j < toneLen; j++) {
+        // Smooth envelope to avoid clicks
+        const env = Math.sin(Math.PI * j / toneLen);
+        toneData[j] = Math.sin(2 * Math.PI * peak.frequency * j / this.audioCtx.sampleRate) * 0.5 * env;
+      }
+
+      // Record tone + decay tail
+      const rec = await this._emitAndRecord(toneBuf, toneDur + decayDur);
+
+      // Measure energy in the tone region vs decay region
+      const toneSamples = Math.round(toneDur * this.audioCtx.sampleRate);
+      const decaySamples = rec.length - toneSamples;
+      let toneEnergy = 0, decayEnergy = 0;
+      for (let j = 0; j < toneSamples && j < rec.length; j++) toneEnergy += rec[j] * rec[j];
+      for (let j = toneSamples; j < rec.length; j++) decayEnergy += rec[j] * rec[j];
+      toneEnergy /= toneSamples || 1;
+      decayEnergy /= decaySamples || 1;
+
+      // Estimate T20 (time for 20dB decay) from energy envelope in decay region
+      // Compute energy in 10ms windows across the decay
+      const windowMs = 10;
+      const windowSamples = Math.round(windowMs * this.audioCtx.sampleRate / 1000);
+      const decayEnvelope = [];
+      for (let j = toneSamples; j + windowSamples <= rec.length; j += windowSamples) {
+        let winEnergy = 0;
+        for (let k = j; k < j + windowSamples; k++) winEnergy += rec[k] * rec[k];
+        decayEnvelope.push(winEnergy / windowSamples);
+      }
+
+      // Find T20: time for energy to drop 20dB from peak
+      let t20Ms = decayDur * 1000; // default: full decay window
+      if (decayEnvelope.length > 2) {
+        const peakEnergy = Math.max(...decayEnvelope);
+        const threshold20 = peakEnergy * 0.01; // -20dB
+        for (let j = 0; j < decayEnvelope.length; j++) {
+          if (decayEnvelope[j] < threshold20) {
+            t20Ms = j * windowMs;
+            break;
+          }
+        }
+      }
+
+      // Estimate RT60 from T20 (RT60 ≈ 3 × T20)
+      const rt60 = (t20Ms / 1000) * 3;
+      // Q factor from RT60: Q = π × f × RT60 / ln(1000) ≈ π × f × RT60 / 6.908
+      const qFactor = Math.PI * peak.frequency * rt60 / 6.908;
+
+      results.push({
+        frequency: peak.frequency,
+        toneEnergy,
+        decayEnergy,
+        gainRatio: toneEnergy / (decayEnergy + 1e-10),
+        qFactor,
+        t20Ms,
+        rt60,
+        cancellationDb: 10 * Math.log10(decayEnergy / (toneEnergy + 1e-10)),
+      });
+
+      await this._wait(100);
+    }
+    return results;
+  }
+
+  // Continuous voice monitoring
+  startVoiceMonitoring(callback) {
+    const source = this.audioCtx.createMediaStreamSource(this.stream);
+    const analyser = this.audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
+
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Float32Array(bufferLength);
+
+    const update = () => {
+      if (!this.isRunning) return;
+      analyser.getFloatFrequencyData(dataArray);
+      // Convert from dB to linear
+      const linear = new Float32Array(bufferLength);
+      for (let i = 0; i < bufferLength; i++) {
+        linear[i] = Math.pow(10, dataArray[i] / 20);
+      }
+      callback(linear);
+      requestAnimationFrame(update);
+    };
+    this.isRunning = true;
+    update();
+    return () => { this.isRunning = false; source.disconnect(); };
+  }
+
+  // Footstep detection — passive monitoring for impact transients in 50-300Hz band
+  startFootstepDetection(noiseFloor, callback) {
+    if (!this.audioCtx || !this.stream) return () => {};
+    const ctx = this.audioCtx;
+    const source = ctx.createMediaStreamSource(this.stream);
+
+    // Bandpass filter chain: highpass(50Hz) -> lowpass(300Hz)
+    const hp = ctx.createBiquadFilter();
+    hp.type = 'highpass';
+    hp.frequency.value = FOOTSTEP_BAND_LOW;
+    hp.Q.value = 0.7;
+
+    const lp = ctx.createBiquadFilter();
+    lp.type = 'lowpass';
+    lp.frequency.value = FOOTSTEP_BAND_HIGH;
+    lp.Q.value = 0.7;
+
+    const processor = ctx.createScriptProcessor(2048, 1, 1);
+    let runningEnergy = 0;
+    let lastDetectionTime = 0;
+    let active = true;
+
+    processor.onaudioprocess = (e) => {
+      if (!active || this._miniChirpActive) return; // pause during chirp bursts
+      const input = e.inputBuffer.getChannelData(0);
+
+      // Compute frame energy
+      let energy = 0;
+      for (let i = 0; i < input.length; i++) energy += input[i] * input[i];
+      energy /= input.length;
+
+      // Exponential moving average
+      if (runningEnergy === 0) runningEnergy = energy;
+      else runningEnergy = runningEnergy * (1 - FOOTSTEP_EMA_ALPHA) + energy * FOOTSTEP_EMA_ALPHA;
+
+      // Transient detection
+      const now = performance.now();
+      if (energy > runningEnergy * FOOTSTEP_ENERGY_MULT &&
+          energy > 1e-6 &&
+          now - lastDetectionTime > FOOTSTEP_MIN_INTERVAL_MS) {
+        lastDetectionTime = now;
+
+        // Classify floor material from impact spectrum
+        const win = getHanningWindow(Math.min(input.length, 512));
+        const padN = nextPow2(win.length);
+        const re = new Float32Array(padN);
+        const im = new Float32Array(padN);
+        for (let i = 0; i < win.length; i++) re[i] = input[i] * win[i];
+        fft(re, im);
+        const impactSpectrum = magnitudeSpectrum(re, im);
+
+        // Use reference spectrum comparison for floor material
+        const floorMaterial = classifyFloorFromImpact(impactSpectrum);
+
+        callback({
+          timestamp: now,
+          energy,
+          floorMaterial,
+          impactSpectrum,
+        });
+      }
+    };
+
+    source.connect(hp);
+    hp.connect(lp);
+    lp.connect(processor);
+    const fsSink = ctx.createGain();
+    fsSink.gain.value = 0;
+    processor.connect(fsSink);
+    fsSink.connect(ctx.destination); // required for ScriptProcessor callbacks in Chrome
+
+    return () => {
+      active = false;
+      processor.disconnect();
+      lp.disconnect();
+      hp.disconnect();
+      source.disconnect();
+    };
+  }
+
+  // Walking mode: short ESS burst (20 sweeps, 1s)
+  async emitMiniChirpBurst(noiseFloor, onProgress) {
+    this._miniChirpActive = true;
+    try {
+      const result = await this.emitSweepBurst(noiseFloor, WALKING_BURST_COUNT, onProgress, null);
+      return result.responses.flatMap(r => r.reflections);
+    } finally {
+      this._miniChirpActive = false;
+    }
+  }
+
+  _wait(ms) {
+    return new Promise(r => setTimeout(r, ms));
+  }
+
+  dispose() {
+    this.isRunning = false;
+    this._miniChirpActive = false;
+    if (this.stream) this.stream.getTracks().forEach(t => t.stop());
+    if (this.audioCtx) this.audioCtx.close();
+  }
+}
+
+// ============================================================
+// IMU TRACKER (accelerometer + gyroscope for dead reckoning)
+// ============================================================
+
+class IMUTracker {
+  constructor() {
+    this.hasPermission = false;
+    this.isTracking = false;
+    this.heading = 0;
+    this.position = { x: 0, y: 0 };
+    this.velocity = { x: 0, y: 0 };
+    this.stepCount = 0;
+    this.strideLength = DEFAULT_STRIDE_M;
+    this.lastStepTime = 0;
+    this.onStep = null;
+    this.onPositionUpdate = null;
+
+    // Low-pass filter state for gravity separation (~0.1Hz corner at 60Hz)
+    this._gravity = { x: 0, y: 0, z: 9.81 };
+    this._lpAlpha = 0.01;
+    this._gravityInitialized = false;
+    this._gravityInitSamples = [];
+
+    // Step detection state machine
+    this._stepState = 'idle'; // idle | rising | falling
+    this._stepStateEntered = 0;
+    this._peakAccel = 0;
+    this._lastMotionTime = 0;
+
+    // Heading from gyroscope
+    this._lastGyroTime = 0;
+
+    // v2: velocity history for delay-rate surface normal estimation
+    this.velocityHistory = [];
+    this.orientationHistory = [];
+    this._linearVelocity = { x: 0, y: 0, z: 0 };
+
+    this._boundHandler = this._handleMotion.bind(this);
+  }
+
+  async requestPermission() {
+    if (typeof DeviceMotionEvent !== 'undefined' &&
+        typeof DeviceMotionEvent.requestPermission === 'function') {
+      // iOS 13+
+      const perm = await DeviceMotionEvent.requestPermission();
+      this.hasPermission = perm === 'granted';
+    } else {
+      // Android / older iOS — no permission needed
+      this.hasPermission = true;
+    }
+    return this.hasPermission;
+  }
+
+  start(onStep, onPositionUpdate) {
+    if (!this.hasPermission) return false;
+    this.onStep = onStep;
+    this.onPositionUpdate = onPositionUpdate;
+    this.isTracking = true;
+    this._lastGyroTime = performance.now();
+    this._lastMotionTime = performance.now();
+    window.addEventListener('devicemotion', this._boundHandler);
+    return true;
+  }
+
+  stop() {
+    this.isTracking = false;
+    window.removeEventListener('devicemotion', this._boundHandler);
+  }
+
+  getPosition() {
+    return { ...this.position };
+  }
+
+  correctPosition(acousticPos, confidence) {
+    if (!acousticPos) return;
+    // Don't apply corrections larger than 2m (likely a bad acoustic fix)
+    const errX = acousticPos.x - this.position.x;
+    const errY = acousticPos.y - this.position.y;
+    const errDist = Math.sqrt(errX * errX + errY * errY);
+    if (errDist > 2.0) return;
+    // Scale correction by acoustic confidence
+    const alpha = DRIFT_CORRECTION_RATE * Math.min(1, confidence || 0.6);
+    this.position.x += errX * alpha;
+    this.position.y += errY * alpha;
+  }
+
+  calibrateStride(acousticDistance, steps) {
+    // Require meaningful sample: 8+ steps, 1.5m+ displacement
+    if (steps < 8 || acousticDistance < 1.5) return;
+    const measured = acousticDistance / steps;
+    // Sanity: human stride is 0.4–1.2m
+    if (measured < 0.4 || measured > 1.2) return;
+    this.strideLength = this.strideLength * 0.8 + measured * 0.2;
+  }
+
+  _handleMotion(event) {
+    const now = performance.now();
+    const dt = (now - this._lastMotionTime) / 1000;
+    this._lastMotionTime = now;
+    if (dt <= 0 || dt > 0.5) return;
+
+    const ag = event.accelerationIncludingGravity;
+    if (!ag || ag.x === null) return;
+
+    // Initialize gravity from first 30 samples (~0.5s at 60Hz) with motion rejection
+    if (!this._gravityInitialized) {
+      this._gravityInitSamples.push({ x: ag.x, y: ag.y, z: ag.z });
+      if (this._gravityInitSamples.length >= 30) {
+        const n = this._gravityInitSamples.length;
+        const mx = this._gravityInitSamples.reduce((s, v) => s + v.x, 0) / n;
+        const my = this._gravityInitSamples.reduce((s, v) => s + v.y, 0) / n;
+        const mz = this._gravityInitSamples.reduce((s, v) => s + v.z, 0) / n;
+        // Check variance — reject if phone was moving during init (stddev > 0.15g)
+        let variance = 0;
+        for (const s of this._gravityInitSamples) {
+          variance += (s.x-mx)**2 + (s.y-my)**2 + (s.z-mz)**2;
+        }
+        variance = Math.sqrt(variance / n);
+        if (variance > 1.47) { // 0.15g * 9.81 = 1.47 m/s²
+          // Too much motion — discard and retry with fresh samples
+          this._gravityInitSamples = [];
+          return;
+        }
+        this._gravity.x = mx;
+        this._gravity.y = my;
+        this._gravity.z = mz;
+        this._gravityInitialized = true;
+      }
+      return;
+    }
+
+    // Low-pass filter gravity (~0.1Hz corner)
+    this._gravity.x = this._gravity.x * (1 - this._lpAlpha) + ag.x * this._lpAlpha;
+    this._gravity.y = this._gravity.y * (1 - this._lpAlpha) + ag.y * this._lpAlpha;
+    this._gravity.z = this._gravity.z * (1 - this._lpAlpha) + ag.z * this._lpAlpha;
+
+    // Prefer OS-provided linear acceleration if available, else subtract gravity
+    const accel = event.acceleration;
+    let ax, ay, az;
+    if (accel && accel.x !== null) {
+      ax = accel.x; ay = accel.y; az = accel.z;
+    } else {
+      ax = ag.x - this._gravity.x;
+      ay = ag.y - this._gravity.y;
+      az = ag.z - this._gravity.z;
+    }
+    const accelMag = Math.sqrt(ax * ax + ay * ay + az * az) / 9.81;
+
+    // Integrate heading — select correct yaw axis based on gravity direction
+    const rr = event.rotationRate;
+    if (rr && rr.alpha !== null) {
+      const gravMag = Math.sqrt(
+        this._gravity.x ** 2 + this._gravity.y ** 2 + this._gravity.z ** 2
+      ) || 9.81;
+      const absGx = Math.abs(this._gravity.x / gravMag);
+      const absGy = Math.abs(this._gravity.y / gravMag);
+      const absGz = Math.abs(this._gravity.z / gravMag);
+
+      let yawRate = 0;
+      if (absGz > 0.7) {
+        // Phone flat: Z-axis is up, alpha = yaw
+        yawRate = rr.alpha * Math.sign(this._gravity.z);
+      } else if (absGy > 0.7) {
+        // Phone portrait: gravity along device Y, yaw = gamma (rotation about device Y-axis)
+        yawRate = rr.gamma * Math.sign(this._gravity.y);
+      } else {
+        // Phone landscape: gravity along device X, yaw = beta (rotation about device X-axis)
+        yawRate = rr.beta * Math.sign(this._gravity.x);
+      }
+      this.heading += (yawRate * Math.PI / 180) * dt;
+      // Wrap heading to [0, 2π)
+      this.heading = ((this.heading % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI);
+    }
+
+    // v2: Track velocity for delay-rate surface normal estimation
+    // High-pass filter (α=0.98) preserves 8-12Hz tremor, rejects DC drift
+    this._linearVelocity.x = 0.98 * (this._linearVelocity.x + ax * dt);
+    this._linearVelocity.y = 0.98 * (this._linearVelocity.y + ay * dt);
+    this._linearVelocity.z = 0.98 * (this._linearVelocity.z + az * dt);
+    const nowSec = now / 1000;
+    this.velocityHistory.push({ time: nowSec, vx: this._linearVelocity.x, vy: this._linearVelocity.y, vz: this._linearVelocity.z });
+    this.orientationHistory.push({ time: nowSec, heading: this.heading });
+    // Trim to last 5 seconds
+    const cutoff = nowSec - 5;
+    while (this.velocityHistory.length > 0 && this.velocityHistory[0].time < cutoff) this.velocityHistory.shift();
+    while (this.orientationHistory.length > 0 && this.orientationHistory[0].time < cutoff) this.orientationHistory.shift();
+
+    // Step detection state machine
+    this._detectStep(accelMag, now);
+  }
+
+  _detectStep(accelMag, now) {
+    switch (this._stepState) {
+      case 'idle':
+        if (accelMag > STEP_THRESHOLD_G) {
+          this._stepState = 'rising';
+          this._stepStateEntered = now;
+          this._peakAccel = accelMag;
+        }
+        break;
+      case 'rising':
+        if (accelMag > this._peakAccel) {
+          this._peakAccel = accelMag;
+        } else {
+          this._stepState = 'falling';
+          this._stepStateEntered = now;
+        }
+        break;
+      case 'falling':
+        // Timeout: escape if stuck in falling for > 400ms
+        if (now - this._stepStateEntered > 400) {
+          this._stepState = 'idle';
+          this._peakAccel = 0;
+          break;
+        }
+        if (accelMag < STEP_THRESHOLD_G * 0.7) {
+          if (now - this.lastStepTime > MIN_STEP_INTERVAL_MS) {
+            this._fireStep(now);
+          }
+          this._stepState = 'idle';
+          this._peakAccel = 0;
+        }
+        break;
+    }
+  }
+
+  _fireStep(now) {
+    this.lastStepTime = now;
+    this.stepCount++;
+
+    // Dead reckoning: heading=0 is North (up on screen), clockwise-positive
+    // Screen coords: Y increases downward, so cos(heading) maps to Y (forward)
+    const dx = this.strideLength * Math.sin(this.heading);
+    const dy = -this.strideLength * Math.cos(this.heading); // heading=0 (North) → -y (up on screen)
+    this.position.x += dx;
+    this.position.y += dy;
+
+    this.onStep?.({
+      stepCount: this.stepCount,
+      position: { ...this.position },
+      heading: this.heading,
+      timestamp: now,
+    });
+    this.onPositionUpdate?.({ ...this.position });
+  }
+}
+
+// ============================================================
+// UI COMPONENTS
+// ============================================================
+
+function WaveformCanvas({ data, width, height, color }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !data || data.length === 0) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.scale(dpr, dpr);
+
+    ctx.fillStyle = '#111119';
+    ctx.fillRect(0, 0, width, height);
+
+    ctx.strokeStyle = color || '#00f5ff';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const step = data.length / width;
+    const mid = height / 2;
+    for (let x = 0; x < width; x++) {
+      const i = Math.floor(x * step);
+      const y = mid + data[i] * mid * 0.9;
+      if (x === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Center line
+    ctx.strokeStyle = 'rgba(0,245,255,0.15)';
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, mid);
+    ctx.lineTo(width, mid);
+    ctx.stroke();
+  }, [data, width, height, color]);
+
+  return <canvas ref={canvasRef} style={{ width, height }} className="rounded-lg" />;
+}
+
+function FloorPlan({ geometry, width, height }) {
+  if (!geometry || !geometry.x || !geometry.y) {
+    return <div className="bg-surface rounded-lg flex items-center justify-center" style={{ width, height }}>
+      <span className="text-beacon-dim text-sm">No geometry data</span>
+    </div>;
+  }
+
+  const padding = 40;
+  const drawW = width - padding * 2;
+  const drawH = height - padding * 2;
+  const scale = Math.min(drawW / geometry.x, drawH / geometry.y);
+  const roomW = geometry.x * scale;
+  const roomH = geometry.y * scale;
+  const offsetX = (width - roomW) / 2;
+  const offsetY = (height - roomH) / 2;
+
+  const phoneX = geometry.phonePosition?.x != null ? offsetX + geometry.phonePosition.x * scale : offsetX + roomW / 2;
+  const phoneY = geometry.phonePosition?.y != null ? offsetY + geometry.phonePosition.y * scale : offsetY + roomH / 2;
+
+  return (
+    <svg width={width} height={height} className="rounded-lg bg-surface">
+      {/* Grid */}
+      {Array.from({ length: Math.ceil(geometry.x) + 1 }, (_, i) => (
+        <line key={`vg${i}`}
+          x1={offsetX + i * scale} y1={offsetY}
+          x2={offsetX + i * scale} y2={offsetY + roomH}
+          stroke="rgba(0,245,255,0.08)" strokeWidth="0.5" />
+      ))}
+      {Array.from({ length: Math.ceil(geometry.y) + 1 }, (_, i) => (
+        <line key={`hg${i}`}
+          x1={offsetX} y1={offsetY + i * scale}
+          x2={offsetX + roomW} y2={offsetY + i * scale}
+          stroke="rgba(0,245,255,0.08)" strokeWidth="0.5" />
+      ))}
+
+      {/* Room outline */}
+      <rect x={offsetX} y={offsetY} width={roomW} height={roomH}
+        fill="none" stroke="#00f5ff" strokeWidth="2" rx="2" />
+
+      {/* Wall labels with materials */}
+      {geometry.walls?.slice(0, 4).map((w, i) => {
+        const positions = [
+          { x: offsetX + roomW / 2, y: offsetY - 8, anchor: 'middle' },
+          { x: offsetX + roomW + 8, y: offsetY + roomH / 2, anchor: 'start' },
+          { x: offsetX + roomW / 2, y: offsetY + roomH + 16, anchor: 'middle' },
+          { x: offsetX - 8, y: offsetY + roomH / 2, anchor: 'end' },
+        ];
+        const pos = positions[i] || positions[0];
+        return <text key={`wl${i}`} x={pos.x} y={pos.y}
+          fill={w.material?.color || '#888'} fontSize="10"
+          textAnchor={pos.anchor} dominantBaseline="middle">
+          {(w.distance ?? 0).toFixed(1)}m
+        </text>;
+      })}
+
+      {/* Objects */}
+      {geometry.objects?.map((obj, i) => {
+        const angle = (i / (geometry.objects.length || 1)) * Math.PI * 2;
+        const r = obj.distance * scale * 0.8;
+        const ox = phoneX + Math.cos(angle) * Math.min(r, roomW * 0.4);
+        const oy = phoneY + Math.sin(angle) * Math.min(r, roomH * 0.4);
+        return <g key={`obj${i}`}>
+          <circle cx={ox} cy={oy} r="6" fill={obj.material?.color || '#888'} opacity="0.6" />
+          <text x={ox} y={oy + 14} fill="#aaa" fontSize="8" textAnchor="middle">
+            {obj.distance.toFixed(1)}m
+          </text>
+        </g>;
+      })}
+
+      {/* Phone position */}
+      <circle cx={phoneX} cy={phoneY} r="6" fill="#00f5ff" />
+      <circle cx={phoneX} cy={phoneY} r="12" fill="none" stroke="#00f5ff" strokeWidth="1" opacity="0.4" />
+      <text x={phoneX} y={phoneY + 22} fill="#00f5ff" fontSize="9" textAnchor="middle">Phone</text>
+
+      {/* Dimensions */}
+      <text x={offsetX + roomW / 2} y={offsetY + roomH + 32}
+        fill="#fff" fontSize="12" textAnchor="middle" fontWeight="bold">
+        {geometry.x.toFixed(1)}m
+      </text>
+      <text x={offsetX + roomW + 28} y={offsetY + roomH / 2}
+        fill="#fff" fontSize="12" textAnchor="middle" fontWeight="bold"
+        transform={`rotate(90, ${offsetX + roomW + 28}, ${offsetY + roomH / 2})`}>
+        {geometry.y.toFixed(1)}m
+      </text>
+    </svg>
+  );
+}
+
+function SpectralChart({ responses, width, height }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !responses?.length) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.scale(dpr, dpr);
+
+    ctx.fillStyle = '#111119';
+    ctx.fillRect(0, 0, width, height);
+
+    const colors = [
+      '#ff4444', '#ff8844', '#ffaa44', '#ffdd44', '#aaff44',
+      '#44ff88', '#44ffdd', '#44ddff', '#4488ff', '#8844ff'
+    ];
+
+    const padding = { left: 40, right: 10, top: 10, bottom: 30 };
+    const plotW = width - padding.left - padding.right;
+    const plotH = height - padding.top - padding.bottom;
+
+    // Axes
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(padding.left, padding.top);
+    ctx.lineTo(padding.left, padding.top + plotH);
+    ctx.lineTo(padding.left + plotW, padding.top + plotH);
+    ctx.stroke();
+
+    // Labels
+    ctx.fillStyle = '#666';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Frequency (Hz)', padding.left + plotW / 2, height - 4);
+
+    // All sweeps emit the same ESS signal — emittedSpectrum is identical for every response.
+    // Plot only one trace to avoid N overlapping identical lines.
+    const firstResp = responses.find(r => r.emittedSpectrum && r.emittedSpectrum.length > 0);
+    if (firstResp) {
+      const spectrum = firstResp.emittedSpectrum;
+      let maxVal = 0;
+      for (let i = 0; i < spectrum.length; i++) if (spectrum[i] > maxVal) maxVal = spectrum[i];
+      if (maxVal > 0) {
+        ctx.strokeStyle = colors[0];
+        ctx.lineWidth = 1;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        for (let i = 0; i < spectrum.length; i++) {
+          const x = padding.left + (i / spectrum.length) * plotW;
+          const y = padding.top + plotH - (spectrum[i] / maxVal) * plotH;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+
+        // Legend
+        ctx.font = '8px monospace';
+        ctx.fillStyle = colors[0];
+        ctx.textAlign = 'left';
+        ctx.fillText('Emitted Sweep Spectrum', padding.left + 5, padding.top + 12);
+      }
+    }
+  }, [responses, width, height]);
+
+  return <canvas ref={canvasRef} style={{ width, height }} className="rounded-lg" />;
+}
+
+function ModalChart({ detectedModes, predictedModes, width, height }) {
+  const canvasRef = useRef(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.scale(dpr, dpr);
+
+    ctx.fillStyle = '#111119';
+    ctx.fillRect(0, 0, width, height);
+
+    const padding = { left: 40, right: 10, top: 10, bottom: 30 };
+    const plotW = width - padding.left - padding.right;
+    const plotH = height - padding.top - padding.bottom;
+
+    const allFreqs = [...(detectedModes || []), ...(predictedModes || [])];
+    const validFreqs = allFreqs.filter(f => Number.isFinite(f));
+    const maxFreq = validFreqs.length > 0 ? Math.max(...validFreqs) * 1.1 : 1000;
+
+    // Axis
+    ctx.strokeStyle = '#333';
+    ctx.beginPath();
+    ctx.moveTo(padding.left, padding.top + plotH);
+    ctx.lineTo(padding.left + plotW, padding.top + plotH);
+    ctx.stroke();
+
+    ctx.fillStyle = '#666';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Frequency (Hz)', padding.left + plotW / 2, height - 4);
+
+    // Predicted modes (gray)
+    if (predictedModes) {
+      predictedModes.forEach(f => {
+        const x = padding.left + (f / maxFreq) * plotW;
+        ctx.strokeStyle = 'rgba(100,100,100,0.5)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, padding.top);
+        ctx.lineTo(x, padding.top + plotH);
+        ctx.stroke();
+      });
+    }
+
+    // Detected modes (cyan)
+    if (detectedModes) {
+      detectedModes.forEach(f => {
+        const x = padding.left + (f / maxFreq) * plotW;
+        ctx.strokeStyle = '#00f5ff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(x, padding.top + 10);
+        ctx.lineTo(x, padding.top + plotH - 5);
+        ctx.stroke();
+        ctx.fillStyle = '#00f5ff';
+        ctx.font = '8px monospace';
+        ctx.fillText(`${f.toFixed(0)}`, x, padding.top + 8);
+      });
+    }
+
+    // Legend
+    ctx.fillStyle = '#666';
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText('| Predicted', width - 90, padding.top + 12);
+    ctx.fillStyle = '#00f5ff';
+    ctx.fillText('| Detected', width - 90, padding.top + 24);
+  }, [detectedModes, predictedModes, width, height]);
+
+  return <canvas ref={canvasRef} style={{ width, height }} className="rounded-lg" />;
+}
+
+// Progressive floor plan with fog-of-war coverage map
+function ProgressiveFloorPlan({ roomModel, width, height }) {
+  const canvasRef = useRef(null);
+  const geometry = roomModel?.geometry;
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !geometry?.x || !geometry?.y) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = width * dpr;
+    canvas.height = height * dpr;
+    ctx.scale(dpr, dpr);
+
+    const padding = 40;
+    const drawW = width - padding * 2;
+    const drawH = height - padding * 2;
+    const scale = Math.min(drawW / geometry.x, drawH / geometry.y);
+    const roomW = geometry.x * scale;
+    const roomH = geometry.y * scale;
+    const offsetX = (width - roomW) / 2;
+    const offsetY = (height - roomH) / 2;
+
+    // Background
+    ctx.fillStyle = '#111119';
+    ctx.fillRect(0, 0, width, height);
+
+    // Fog of war grid
+    if (roomModel.coverageGrid && roomModel.gridWidth > 0) {
+      for (let gy = 0; gy < roomModel.gridHeight; gy++) {
+        for (let gx = 0; gx < roomModel.gridWidth; gx++) {
+          const coverage = roomModel.coverageGrid[gy * roomModel.gridWidth + gx];
+          const wx = gx * GRID_RESOLUTION_M + roomModel.gridOffsetX;
+          const wy = gy * GRID_RESOLUTION_M + roomModel.gridOffsetY;
+
+          // Convert world coords to screen
+          const px = geometry.phonePosition?.x || geometry.x / 2;
+          const py = geometry.phonePosition?.y || geometry.y / 2;
+          const sx = offsetX + (wx + px) * scale;
+          const sy = offsetY + (wy + py) * scale;
+          const cellW = GRID_RESOLUTION_M * scale;
+
+          // Only draw within room bounds
+          if (sx >= offsetX && sx + cellW <= offsetX + roomW &&
+              sy >= offsetY && sy + cellW <= offsetY + roomH) {
+            const fogOpacity = Math.max(0, 0.7 - coverage * 0.7);
+            if (fogOpacity > 0.02) {
+              ctx.fillStyle = `rgba(10, 10, 15, ${fogOpacity})`;
+              ctx.fillRect(sx, sy, cellW + 0.5, cellW + 0.5);
+            }
+            // Confidence tint
+            if (coverage > 0.3) {
+              ctx.fillStyle = `rgba(0, 245, 255, ${coverage * 0.08})`;
+              ctx.fillRect(sx, sy, cellW + 0.5, cellW + 0.5);
+            }
+          }
+        }
+      }
+    }
+
+    // Room outline
+    ctx.strokeStyle = '#00f5ff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(offsetX, offsetY, roomW, roomH);
+
+    // Grid lines
+    ctx.strokeStyle = 'rgba(0,245,255,0.06)';
+    ctx.lineWidth = 0.5;
+    for (let m = 1; m < geometry.x; m++) {
+      const x = offsetX + m * scale;
+      ctx.beginPath(); ctx.moveTo(x, offsetY); ctx.lineTo(x, offsetY + roomH); ctx.stroke();
+    }
+    for (let m = 1; m < geometry.y; m++) {
+      const y = offsetY + m * scale;
+      ctx.beginPath(); ctx.moveTo(offsetX, y); ctx.lineTo(offsetX + roomW, y); ctx.stroke();
+    }
+
+    // Phone position (origin)
+    const phonePx = geometry.phonePosition?.x || geometry.x / 2;
+    const phonePy = geometry.phonePosition?.y || geometry.y / 2;
+
+    // Position history trail
+    if (roomModel.positionHistory.length > 1) {
+      ctx.strokeStyle = 'rgba(0, 245, 255, 0.3)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      roomModel.positionHistory.forEach((p, i) => {
+        const sx = offsetX + (p.x + phonePx) * scale;
+        const sy = offsetY + (p.y + phonePy) * scale;
+        if (i === 0) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+      });
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // Footstep markers
+    roomModel.footsteps.forEach(f => {
+      const sx = offsetX + (f.position.x + phonePx) * scale;
+      const sy = offsetY + (f.position.y + phonePy) * scale;
+      ctx.fillStyle = f.floorMaterial?.color || '#888';
+      ctx.beginPath();
+      ctx.arc(sx, sy, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // Observation points (chirp bursts)
+    roomModel.observations.forEach((obs, i) => {
+      if (i === 0) return; // skip initial (it's the phone position)
+      const sx = offsetX + (obs.position.x + phonePx) * scale;
+      const sy = offsetY + (obs.position.y + phonePy) * scale;
+      ctx.strokeStyle = 'rgba(0, 245, 255, 0.2)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(sx, sy, 8, 0, Math.PI * 2);
+      ctx.stroke();
+    });
+
+    // Current position (pulsing dot)
+    const curPos = roomModel.currentPosition;
+    const curSx = offsetX + (curPos.x + phonePx) * scale;
+    const curSy = offsetY + (curPos.y + phonePy) * scale;
+    ctx.fillStyle = '#00f5ff';
+    ctx.beginPath();
+    ctx.arc(curSx, curSy, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(0, 245, 255, 0.4)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(curSx, curSy, 12, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Phone label at origin
+    const originSx = offsetX + phonePx * scale;
+    const originSy = offsetY + phonePy * scale;
+    if (Math.abs(curSx - originSx) > 15 || Math.abs(curSy - originSy) > 15) {
+      ctx.fillStyle = 'rgba(0, 245, 255, 0.4)';
+      ctx.beginPath();
+      ctx.arc(originSx, originSy, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#666';
+      ctx.font = '8px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Start', originSx, originSy + 14);
+    }
+
+    // Dimension labels
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${geometry.x.toFixed(1)}m`, offsetX + roomW / 2, offsetY + roomH + 20);
+    ctx.save();
+    ctx.translate(offsetX + roomW + 20, offsetY + roomH / 2);
+    ctx.rotate(Math.PI / 2);
+    ctx.fillText(`${geometry.y.toFixed(1)}m`, 0, 0);
+    ctx.restore();
+  }, [roomModel, roomModel?.observations?.length, roomModel?.footsteps?.length,
+      roomModel?.currentPosition?.x, roomModel?.currentPosition?.y, width, height]);
+
+  if (!geometry?.x || !geometry?.y) {
+    return <div className="bg-surface rounded-lg flex items-center justify-center" style={{ width, height }}>
+      <span className="text-beacon-dim text-sm">No geometry data</span>
+    </div>;
+  }
+
+  return <canvas ref={canvasRef} style={{ width, height }} className="rounded-lg" />;
+}
+
+// Walking mode panel — shown during progressive mapping
+function WalkingModePanel({ roomModel, walkingStats, walkingStatus, onStop, chartWidth, chartHeight }) {
+  return (
+    <div className="space-y-4">
+      {/* Stats bar */}
+      <div className="grid grid-cols-3 gap-2">
+        <div className="bg-surface rounded-lg p-3 text-center border border-gray-800">
+          <div className="text-2xl font-bold text-beacon">{walkingStats.steps}</div>
+          <div className="text-gray-500 text-xs">Steps</div>
+        </div>
+        <div className="bg-surface rounded-lg p-3 text-center border border-gray-800">
+          <div className="text-2xl font-bold text-white">{walkingStats.distance.toFixed(1)}m</div>
+          <div className="text-gray-500 text-xs">Distance</div>
+        </div>
+        <div className="bg-surface rounded-lg p-3 text-center border border-gray-800">
+          <div className="text-2xl font-bold text-success">{walkingStats.coverage.toFixed(0)}%</div>
+          <div className="text-gray-500 text-xs">Coverage</div>
+        </div>
+      </div>
+
+      {/* Coverage progress bar */}
+      <div className="bg-surface rounded-lg p-3 border border-gray-800">
+        <div className="flex justify-between items-center mb-1">
+          <span className="text-gray-400 text-xs">Room Coverage</span>
+          <span className="text-beacon text-xs font-bold">{walkingStats.coverage.toFixed(0)}%</span>
+        </div>
+        <div className="h-2 bg-surface-alt rounded-full overflow-hidden">
+          <div className="h-full bg-beacon/60 rounded-full transition-all duration-500"
+            style={{ width: `${Math.min(100, walkingStats.coverage)}%` }} />
+        </div>
+      </div>
+
+      {/* Progressive floor plan */}
+      <div className="bg-surface rounded-xl p-4 border border-gray-800">
+        <h3 className="text-beacon font-bold text-sm mb-3">Live Coverage Map</h3>
+        <ProgressiveFloorPlan roomModel={roomModel} width={chartWidth - 32} height={chartHeight} />
+      </div>
+
+      {/* Floor material */}
+      {walkingStats.floorMaterial && (
+        <div className="bg-surface rounded-lg p-3 border border-gray-800 flex items-center gap-3">
+          <div className="w-4 h-4 rounded-full" style={{ backgroundColor: walkingStats.floorMaterial.color }} />
+          <div>
+            <div className="text-gray-300 text-xs">Floor Material</div>
+            <div className="text-white text-sm">{walkingStats.floorMaterial.label}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Status */}
+      <div className="text-center text-gray-400 text-xs py-1">
+        {walkingStatus || 'Walking...'}
+      </div>
+
+      {/* Observations count */}
+      <div className="text-center text-gray-600 text-xs">
+        {roomModel?.observations?.length || 0} observation points
+      </div>
+
+      {/* Spacer for sticky button at bottom */}
+      <div className="h-20" />
+    </div>
+  );
+}
+
+// IMU permission prompt for walking mode
+function IMUPermissionPrompt({ onGranted, onSkip }) {
+  const [requesting, setRequesting] = useState(false);
+  const [error, setError] = useState(null);
+
+  const handleRequest = useCallback(async () => {
+    setRequesting(true);
+    setError(null);
+    try {
+      if (typeof DeviceMotionEvent !== 'undefined' &&
+          typeof DeviceMotionEvent.requestPermission === 'function') {
+        const perm = await DeviceMotionEvent.requestPermission();
+        if (perm === 'granted') {
+          onGranted(true);
+        } else {
+          setError('Motion sensor access denied.');
+          onGranted(false);
+        }
+      } else {
+        // Android / desktop — no permission needed
+        onGranted(true);
+      }
+    } catch (e) {
+      setError(e.message);
+      onGranted(false);
+    }
+    setRequesting(false);
+  }, [onGranted]);
+
+  return (
+    <div className="bg-surface rounded-xl p-6 border border-gray-800 text-center">
+      <div className="text-4xl mb-3">
+        <span role="img" aria-label="walking">&#x1F6B6;</span>
+      </div>
+      <h3 className="text-beacon font-bold text-lg mb-2">Walking Mode</h3>
+      <p className="text-gray-400 text-sm mb-4">
+        Walk around your room to progressively map it. Motion sensors track your position
+        while periodic chirps build up the acoustic model.
+      </p>
+
+      {error && (
+        <p className="text-danger text-xs mb-3">{error}</p>
+      )}
+
+      <button onClick={handleRequest} disabled={requesting}
+        className="w-full bg-beacon/20 text-beacon border border-beacon/30 px-4 py-3 rounded-lg text-sm font-bold active:scale-95 transition-transform mb-2 disabled:opacity-50">
+        {requesting ? 'Requesting...' : 'Allow Motion Sensors & Start'}
+      </button>
+
+      <button onClick={onSkip}
+        className="w-full text-gray-500 text-xs py-2 active:text-gray-300">
+        Skip (walk mode without motion tracking)
+      </button>
+    </div>
+  );
+}
+
+function StatusPipeline({ phase }) {
+  const stages = [
+    { key: 'ambient', label: 'Ambient' },
+    { key: 'scanning', label: 'Scanning' },
+    { key: 'processing', label: 'Processing' },
+    { key: 'results', label: 'Results' },
+    { key: 'walking', label: 'Walking' },
+  ];
+
+  const phaseOrder = {
+    'idle': -1, 'calibrating': 0,
+    'ambient': 0, 'scanning': 1,
+    'processing': 2, 'results': 3,
+    'voice-cal': 3, 'voice-listen': 3,
+    'walking-init': 4, 'walking': 4,
+  };
+  const currentIdx = phaseOrder[phase] ?? -1;
+
+  return (
+    <div className="flex items-center gap-1 w-full overflow-x-auto py-2">
+      {stages.map((s, i) => {
+        const isActive = i === currentIdx;
+        const isDone = i < currentIdx;
+        return (
+          <div key={s.key} className="flex items-center gap-1 flex-shrink-0">
+            <div className={`w-2 h-2 rounded-full transition-colors duration-300 ${
+              isDone ? 'bg-success' : isActive ? 'bg-beacon animate-pulse' : 'bg-gray-700'
+            }`} />
+            <span className={`text-xs ${
+              isDone ? 'text-success' : isActive ? 'text-beacon' : 'text-gray-600'
+            }`}>{s.label}</span>
+            {i < stages.length - 1 && <span className="text-gray-700 text-xs mx-0.5">&rarr;</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function VoiceProximityPanel({ engine, roomGeometry, isActive }) {
+  const [calState, setCalState] = useState('idle'); // idle, calibrating, ready, listening
+  const [fingerprint, setFingerprint] = useState(null);
+  const [distance, setDistance] = useState(null);
+  const [calDistance] = useState(0.6); // arm's length ~60cm
+  const stopRef = useRef(null);
+
+  const startCalibration = useCallback(async () => {
+    if (!engine) return;
+    setCalState('calibrating');
+
+    const recording = await engine.recordAmbient(2, null, null);
+    const spectrum = averageSpectrum(recording, 2048, 512);
+    setFingerprint({ spectrum, distance: calDistance });
+    setCalState('ready');
+  }, [engine, calDistance]);
+
+  const startListening = useCallback(() => {
+    if (!engine || !fingerprint) return;
+    setCalState('listening');
+    stopRef.current = engine.startVoiceMonitoring((spectrum) => {
+      const dist = estimateVoiceDistance(spectrum, fingerprint, calDistance, roomGeometry);
+      setDistance(dist);
+    });
+  }, [engine, fingerprint, calDistance, roomGeometry]);
+
+  const stopListening = useCallback(() => {
+    if (stopRef.current) stopRef.current();
+    setCalState('ready');
+    setDistance(null);
+  }, []);
+
+  useEffect(() => {
+    return () => { if (stopRef.current) stopRef.current(); };
+  }, []);
+
+  if (!isActive) return null;
+
+  return (
+    <div className="bg-surface rounded-xl p-4 mt-4 border border-gray-800">
+      <h3 className="text-beacon font-bold text-sm mb-3">Voice Proximity</h3>
+
+      {calState === 'idle' && (
+        <div>
+          <p className="text-gray-400 text-xs mb-3">
+            Hold the phone at arm's length (~60cm) and say "hello" when prompted.
+          </p>
+          <button onClick={startCalibration}
+            className="bg-beacon/20 text-beacon border border-beacon/30 px-4 py-2 rounded-lg text-sm font-medium active:scale-95 transition-transform w-full">
+            Calibrate Voice
+          </button>
+        </div>
+      )}
+
+      {calState === 'calibrating' && (
+        <div className="text-center py-4">
+          <div className="text-beacon animate-pulse text-lg mb-2">Listening...</div>
+          <p className="text-gray-400 text-xs">Say "hello" at arm's length now</p>
+        </div>
+      )}
+
+      {calState === 'ready' && (
+        <button onClick={startListening}
+          className="bg-success/20 text-success border border-success/30 px-4 py-2 rounded-lg text-sm font-medium active:scale-95 transition-transform w-full">
+          Start Proximity Tracking
+        </button>
+      )}
+
+      {calState === 'listening' && (
+        <div>
+          <div className="text-center py-4">
+            <div className="text-6xl font-bold text-beacon mb-1">
+              {distance !== null ? distance.toFixed(1) : '--'}
+            </div>
+            <div className="text-gray-400 text-sm">meters away</div>
+            <div className={`mt-2 text-xs ${
+              distance && distance < 1 ? 'text-success' :
+              distance && distance < 3 ? 'text-warn' : 'text-danger'
+            }`}>
+              {distance && distance < 1 ? 'Very close' :
+               distance && distance < 3 ? 'Nearby' :
+               distance && distance < 6 ? 'Across the room' : 'Far away'}
+            </div>
+          </div>
+          <button onClick={stopListening}
+            className="bg-danger/20 text-danger border border-danger/30 px-4 py-2 rounded-lg text-sm font-medium active:scale-95 transition-transform w-full mt-2">
+            Stop
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+
+function App() {
+  const [phase, setPhase] = useState('idle');
+  const [status, setStatus] = useState('Tap MAP ROOM to begin');
+  const [micPermission, setMicPermission] = useState(null);
+  const [error, setError] = useState(null);
+  const [waveformData, setWaveformData] = useState(null);
+  const [results, setResults] = useState(null);
+  const [latencyMs, setLatencyMs] = useState(null);
+  const [roomTempC, setRoomTempC] = useState(20);
+
+  // Progressive mapping state
+  const [walkingStats, setWalkingStats] = useState({ steps: 0, distance: 0, coverage: 0, floorMaterial: null });
+  const [walkingStatus, setWalkingStatus] = useState('');
+
+  // Multi-device state (MDV-T02/T03)
+  const [multiDevice, setMultiDevice] = useState({
+    active: false, connected: false, role: null, deviceCount: 0,
+    roomCode: '', serverUrl: '', syncAccuracy: null, phase: 'idle', // idle|pairing|syncing|ready|scanning
+  });
+  const deviceLinkRef = useRef(null);
+
+  const engineRef = useRef(null);
+  const containerRef = useRef(null);
+  const roomModelRef = useRef(null);
+  const imuTrackerRef = useRef(null);
+  const walkingIntervalsRef = useRef([]);
+  const footstepStopRef = useRef(null);
+  const [viewWidth, setViewWidth] = useState(360);
+
+  useEffect(() => {
+    const updateWidth = () => {
+      setViewWidth(Math.min(window.innerWidth - 32, 500));
+    };
+    updateWidth();
+    window.addEventListener('resize', updateWidth);
+    return () => window.removeEventListener('resize', updateWidth);
+  }, []);
+
+  useEffect(() => { SPEED_OF_SOUND = 331.3 * Math.sqrt(1 + roomTempC / 273.15); }, [roomTempC]);
+
+  // Request microphone permission immediately on page load
+  useEffect(() => {
+    (async () => {
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          setMicPermission(false);
+          setError(window.isSecureContext === false
+            ? 'Microphone access requires HTTPS.'
+            : 'Browser does not support microphone access.');
+          return;
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        });
+        // Permission granted — stop the stream (engine.init() will re-acquire)
+        stream.getTracks().forEach(t => t.stop());
+        setMicPermission(true);
+      } catch (e) {
+        if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+          setMicPermission(false);
+        } else {
+          setMicPermission(false);
+          setError(e.message);
+        }
+      }
+    })();
+  }, []);
+
+  const startMapping = useCallback(async () => {
+    setError(null);
+    setResults(null);
+
+    try {
+      // Initialize engine
+      setPhase('calibrating');
+      setStatus('Requesting microphone access...');
+
+      const engine = new AcousticEngine();
+      engineRef.current = engine;
+      await engine.init();
+      setMicPermission(true);
+
+      // Start IMU tracking eagerly for delay-rate surface normal estimation
+      try {
+        const imu = new IMUTracker();
+        const imuGranted = await imu.requestPermission();
+        if (imuGranted) {
+          imu.start(() => {}, () => {}); // no-op callbacks — we just need velocity history
+          imuTrackerRef.current = imu;
+        }
+      } catch (_) {} // IMU is optional — continue without it
+
+      // Latency calibration
+      const latency = await engine.calibrateLatency(setStatus);
+      setLatencyMs(latency);
+
+      // Phase 1: Ambient capture
+      setPhase('ambient');
+      const ambientRecording = await engine.recordAmbient(
+        AMBIENT_DURATION_S, setStatus, setWaveformData
+      );
+      setStatus('Analyzing ambient noise...');
+
+      const sr = engine.audioCtx.sampleRate;
+      const padN = nextPow2(FFT_SIZE);
+      // Noise floor: use first half of ambient recording
+      const halfLen = Math.floor(ambientRecording.length / 2);
+      const noiseFloor = averageSpectrum(ambientRecording.slice(0, halfLen), FFT_SIZE, FFT_SIZE >> 1);
+      // Ambient spectrum: use second half (independent data for peak detection)
+      const ambientSpectrum = averageSpectrum(ambientRecording.slice(halfLen), FFT_SIZE, FFT_SIZE >> 1);
+      const modalPeaks = findSpectralPeaks(
+        ambientSpectrum, noiseFloor, MODAL_PEAK_THRESHOLD_DB, sr, padN
+      ).slice(0, 20);
+
+      setStatus(`Baseline captured (${modalPeaks.length} room modes)`);
+
+      // Phase 2: ESS Sweep Burst — 40 rapid sweeps for delay-rate tracking
+      setPhase('scanning');
+      setStatus('Get ready \u2014 scan tones are about to play...');
+      await engine._wait(1500);
+      const sweepResult = await engine.emitSweepBurst(
+        noiseFloor, ESS_BURST_COUNT, setStatus, setWaveformData
+      );
+      const { echoHistory, sweepTimestamps, responses, rt60 } = sweepResult;
+
+      // Phase 3: Processing — delay-rate tracking + geometry solving
+      setPhase('processing');
+      setStatus('Tracking echo delay-rates...');
+      // Discard first 3 sweeps (AGC settling transient corrupts amplitudes)
+      const stableEchoHistory = echoHistory.slice(3);
+      const stableSweepTimestamps = sweepTimestamps.slice(3);
+      const rawTracks = trackDelayRates(stableEchoHistory, stableSweepTimestamps);
+
+      // Filter second-order / multi-path echo ghosts.
+      //
+      // Two-pass strategy:
+      //
+      // Pass 1 — absolute indoor cap:
+      //   Any echo beyond MAX_INDOOR_DIST (12m) is physically impossible in a domestic
+      //   room and is unconditionally removed. All echoes between 0.3m and 12m are kept
+      //   by default — this range includes every plausible body reflection, near-wall,
+      //   and far-wall echo in rooms up to ~8m across.
+      //
+      // Pass 2 — harmonic ghost suppression:
+      //   Second-order (and third-order) reflections appear at ≈ 2× and 3× a confirmed
+      //   first-order distance. A track is a harmonic ghost if:
+      //     (a) its distance is ≥ MIN_HARMONIC_DIST (3m) so we don't suppress real walls, AND
+      //     (b) there exists a lower-distance track whose 2× or 3× multiple is within
+      //         HARMONIC_TOLERANCE (15%) of this track's distance.
+      //   Harmonic ghosts are weaker echoes that happen to survive the MIN_TRACKS filter;
+      //   the stronger first-order echo at d/2 or d/3 is the reliable signal.
+      //
+      // What this deliberately does NOT do:
+      //   - It does NOT use gap analysis between body echoes and wall echoes (the old
+      //     approach misidentified the 0.8m→1.5m gap as a multi-path boundary).
+      //   - It does NOT require ≥4 tracks before engaging (the old guard meant 0 filtering
+      //     happened when only 2–3 tracks survived — harmonic pass still runs).
+      const MAX_INDOOR_DIST   = 12.0; // m — hard ceiling; no domestic room is larger
+      const MIN_HARMONIC_DIST = 3.0;  // m — never suppress echoes closer than this as harmonics
+      const HARMONIC_TOLERANCE = 0.15; // 15% — accounts for angle-of-incidence path-length variation
+
+      // Pass 1: absolute cap
+      const capFiltered = rawTracks.filter(t => t.meanDistance <= MAX_INDOOR_DIST);
+
+      // Pass 2: harmonic ghost suppression
+      // Build set of confirmed first-order distances (all tracks that survive Pass 1)
+      const firstOrderDists = capFiltered.map(t => t.meanDistance);
+      const tracks = capFiltered.filter(candidate => {
+        if (candidate.meanDistance < MIN_HARMONIC_DIST) return true; // too close to be a harmonic — keep unconditionally
+        const d = candidate.meanDistance;
+        for (const d1 of firstOrderDists) {
+          if (d1 >= d) continue; // only check tracks closer than the candidate
+          for (const multiplier of [2, 3]) {
+            const expected = d1 * multiplier;
+            if (Math.abs(d - expected) / expected <= HARMONIC_TOLERANCE) {
+              return false; // this track looks like a harmonic ghost of d1 — discard
+            }
+          }
+        }
+        return true; // no harmonic match found — keep
+      });
+
+      // TODO: Pass 3 — Once geometry is solved, predict 2nd-order corner-reflection distances
+      // (d = sqrt(d_wallA² + d_wallB²) for 90° corners) and retroactively remove matching tracks.
+      // Currently blocked by the filter running before the solver. Requires a two-pass architecture.
+
+      setStatus(`Found ${tracks.length} surface tracks (${rawTracks.length - tracks.length} multi-path filtered)`);
+
+      // Estimate surface normals (IMU velocity if available)
+      const imuVelocity = imuTrackerRef.current?.velocityHistory || [];
+      estimateSurfaceNormals(tracks, imuVelocity, stableSweepTimestamps);
+
+      // Compute scan quality score (after normals have been assigned)
+      const USABLE_SWEEPS = ESS_BURST_COUNT - 3; // 3 AGC-settling sweeps discarded
+      const multiPathFiltered = rawTracks.length - tracks.length;
+      const imuNormalCount = tracks.filter(t => t.normalFromIMU).length;
+      const avgDetections = tracks.length > 0
+        ? tracks.reduce((sum, t) => sum + (t.detectionCount || 0), 0) / tracks.length
+        : 0;
+      const qualityLabel = tracks.length >= 5 ? 'Good'
+        : tracks.length >= 3 ? 'Fair'
+        : 'Poor';
+      const scanQuality = {
+        rawTrackCount: rawTracks.length,
+        trackCount: tracks.length,
+        multiPathFiltered,
+        imuNormalCount,
+        fallbackNormalCount: tracks.length - imuNormalCount,
+        avgDetectionsPerTrack: avgDetections,
+        usableSweeps: USABLE_SWEEPS,
+        label: qualityLabel,
+      };
+
+      // Solve geometry via least-squares
+      setStatus('Solving room geometry...');
+      const geometry = solveGeometryFromDelayRates(tracks, modalPeaks);
+      if (rt60 && rt60 > 0.05 && rt60 < 5.0) geometry.rt60 = rt60;
+
+      // Compile results
+      const compiledResults = {
+        geometry,
+        modalPeaks,
+        interferenceResults: [],
+        responses,
+        ambientSpectrum,
+        noiseFloor,
+        latencyMs: latency,
+        tracks,
+        echoHistory,
+        sweepTimestamps,
+        scanQuality,
+        timestamp: new Date().toISOString(),
+      };
+
+      setResults(compiledResults);
+      setPhase('results');
+      setStatus('Room mapping complete');
+
+    } catch (err) {
+      console.error('Mapping error:', err);
+      // Clean up engine on error to prevent AudioContext leak
+      if (engineRef.current) { try { engineRef.current.dispose(); } catch(_) {} engineRef.current = null; }
+      if (imuTrackerRef.current) { try { imuTrackerRef.current.stop(); } catch(_) {} imuTrackerRef.current = null; }
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setMicPermission(false);
+        setError('Microphone access denied. Please allow microphone access and try again.');
+      } else {
+        setError(err.message || 'An error occurred during room mapping.');
+      }
+      setPhase('idle');
+      setStatus('Tap MAP ROOM to begin');
+    }
+  }, []);
+
+  // ============================================================
+  // MULTI-DEVICE: Pairing, Clock Sync, Sweep Coordination
+  // ============================================================
+
+  const startMultiDevice = useCallback(async (serverUrl, roomCode) => {
+    try {
+      const link = new DeviceLink();
+      deviceLinkRef.current = link;
+
+      // State change handler
+      link.onStateChange = (state) => {
+        setMultiDevice(prev => ({ ...prev, ...state, active: true }));
+      };
+
+      // App-level message handler (sweep triggers, echo peaks, geometry)
+      link.onMessage = async (msg) => {
+        if (msg.type === 'sweep-trigger' && multiDevice.role === 'recorder') {
+          // MDV-T06: Recorder receives sweep trigger from emitter
+          handleRemoteSweepTrigger(msg.payload);
+        }
+        if (msg.type === 'echo-peaks' && multiDevice.role === 'emitter') {
+          // MDV-T07: Emitter receives echo peaks from recorder
+          handleRemoteEchoPeaks(msg.payload);
+        }
+        if (msg.type === 'geometry-update') {
+          // MDV-T09: Both devices receive geometry updates
+          if (msg.payload.geometry) {
+            setResults(prev => prev ? { ...prev, geometry: msg.payload.geometry } : null);
+          }
+        }
+      };
+
+      setMultiDevice(prev => ({ ...prev, phase: 'pairing', serverUrl, roomCode }));
+      await link.connect(serverUrl, roomCode);
+
+      // Wait for partner (poll until deviceCount >= 2)
+      setStatus('Waiting for partner device...');
+      while (link.deviceCount < 2) {
+        await new Promise(r => setTimeout(r, 500));
+        if (!link.connected) throw new Error('Disconnected while waiting');
+      }
+
+      // Clock sync — only the EMITTER initiates (recorder just responds)
+      if (link.role === 'emitter') {
+        setMultiDevice(prev => ({ ...prev, phase: 'syncing' }));
+        setStatus('Synchronizing clocks...');
+        // Small delay to let recorder's message handler initialize
+        await new Promise(r => setTimeout(r, 500));
+        const sync = await link.syncClock(10);
+        setMultiDevice(prev => ({ ...prev, syncAccuracy: sync.accuracy, phase: 'ready' }));
+        setStatus(`Synced (±${sync.accuracy.toFixed(1)}ms). Ready to scan.`);
+      } else {
+        // Recorder waits for emitter to complete sync, then marks ready
+        setMultiDevice(prev => ({ ...prev, phase: 'syncing' }));
+        setStatus('Waiting for emitter to sync clocks...');
+        // The recorder's clock offset is the negative of the emitter's
+        // It will be populated by responding to clock-sync-request messages
+        // Just wait until the emitter finishes and sends a ready signal
+        await new Promise(r => setTimeout(r, 3000)); // Give emitter time to sync
+        setMultiDevice(prev => ({ ...prev, syncAccuracy: 2.0, phase: 'ready' }));
+        setStatus('Ready. Waiting for emitter to start scan.');
+      }
+
+    } catch (err) {
+      setError(err.message);
+      setMultiDevice(prev => ({ ...prev, active: false, connected: false, phase: 'idle' }));
+    }
+  }, []);
+
+  // MDV-T06: Handle sweep trigger on recorder side
+  const handleRemoteSweepTrigger = useCallback(async (payload) => {
+    const link = deviceLinkRef.current;
+    const engine = engineRef.current;
+    if (!link || !engine) return;
+
+    const { sweepIndex, emitTime, sweepParams } = payload;
+    const localEmitTime = link.localTime(emitTime);
+
+    // Generate the same sweep locally for deconvolution
+    const sr = engine.audioCtx?.sampleRate || SAMPLE_RATE;
+    const sweep = generateExponentialSweep(sweepParams.f1, sweepParams.f2, sweepParams.duration, sr);
+    const invFilter = generateInverseFilter(sweep, sweepParams.f1, sweepParams.f2, sweepParams.duration, sr);
+
+    // Wait until just before the sweep arrives
+    const now = performance.now();
+    const waitMs = localEmitTime - now - (link.syncAccuracy || 5) - 10;
+    if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
+    // Record for sweep duration + echo window
+    const recDur = sweepParams.duration + ESS_ECHO_WINDOW_S + 0.050; // +50ms margin
+    const recording = await engine._emitAndRecord(
+      engine.audioCtx.createBuffer(1, 1, sr), // empty buffer (don't emit anything)
+      recDur
+    );
+
+    // Deconvolve and extract peaks
+    const rir = deconvolveImpulseResponse(recording, invFilter);
+    // For separated devices, direct path = speaker→mic through air (not chassis coupling)
+    // Find it via cross-correlation peak
+    let directPathSamples = 0;
+    let maxVal = 0;
+    for (let i = 0; i < Math.min(rir.length, Math.round(0.1 * sr)); i++) {
+      if (Math.abs(rir[i]) > maxVal) { maxVal = Math.abs(rir[i]); directPathSamples = i; }
+    }
+    const directPathDistance = directPathSamples / sr * SPEED_OF_SOUND; // one-way, NOT /2
+
+    const maxSearch = directPathSamples + Math.round(ESS_ECHO_WINDOW_S * sr);
+    const peaks = extractEchoPeaks(rir, directPathSamples, sr, 8, maxSearch);
+
+    // Send peaks back to emitter
+    link.send('echo-peaks', {
+      sweepIndex,
+      directPathDistance,
+      peaks: peaks.map(p => ({
+        distance: p.distance,
+        amplitude: p.amplitude,
+        timeSec: p.timeSec,
+      })),
+    });
+  }, []);
+
+  // MDV-T07: Handle echo peaks received from recorder
+  const remoteEchoDataRef = useRef([]);
+  const handleRemoteEchoPeaks = useCallback((payload) => {
+    remoteEchoDataRef.current.push(payload);
+  }, []);
+
+  // MDV-T06: Start multi-device scan (emitter side)
+  const startMultiDeviceScan = useCallback(async () => {
+    const link = deviceLinkRef.current;
+    const engine = engineRef.current;
+    if (!link || !engine || link.role !== 'emitter') return;
+
+    setPhase('scanning');
+    remoteEchoDataRef.current = [];
+
+    const sr = engine.audioCtx?.sampleRate || SAMPLE_RATE;
+    const sweep = generateExponentialSweep(ESS_F1, ESS_F2, ESS_DURATION_S, sr);
+    const sweepParams = { f1: ESS_F1, f2: ESS_F2, duration: ESS_DURATION_S, sr };
+
+    for (let i = 0; i < ESS_BURST_COUNT; i++) {
+      setStatus(`Multi-device scan ${i + 1}/${ESS_BURST_COUNT}...`);
+
+      // Schedule sweep 100ms in the future
+      const emitTime = performance.now() + 100;
+      const partnerEmitTime = link.partnerTime(emitTime);
+
+      // Tell recorder when sweep will happen
+      link.send('sweep-trigger', { sweepIndex: i, emitTime: partnerEmitTime, sweepParams });
+
+      // Wait until scheduled time
+      const waitMs = emitTime - performance.now();
+      if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+
+      // Play the sweep
+      const buf = engine.audioCtx.createBuffer(1, sweep.length, sr);
+      buf.getChannelData(0).set(sweep);
+      const player = engine.audioCtx.createBufferSource();
+      player.buffer = buf;
+      player.connect(engine.audioCtx.destination);
+      player.start();
+
+      // Wait for sweep + echo window before next
+      await new Promise(r => setTimeout(r, (ESS_DURATION_S + ESS_ECHO_WINDOW_S) * 1000 + 50));
+    }
+
+    // Wait for remote peaks to arrive (up to 3 seconds)
+    setStatus('Waiting for recorder data...');
+    const deadline = Date.now() + 3000;
+    while (remoteEchoDataRef.current.length < ESS_BURST_COUNT * 0.5 && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 200));
+    }
+
+    // Process results
+    setPhase('processing');
+    setStatus(`Received ${remoteEchoDataRef.current.length} echo packets from recorder`);
+
+    // Build echo history from remote data
+    const echoHistory = remoteEchoDataRef.current.map(d => d.peaks || []);
+    const sweepTimestamps = remoteEchoDataRef.current.map((_, i) => i * ESS_SWEEP_PERIOD_S);
+
+    // Track delay rates
+    const tracks = trackDelayRates(echoHistory, sweepTimestamps);
+    estimateSurfaceNormals(tracks, [], sweepTimestamps);
+    const geometry = solveGeometryFromDelayRates(tracks, []);
+
+    // Add baseline distance from direct path
+    if (remoteEchoDataRef.current.length > 0) {
+      const avgBaseline = remoteEchoDataRef.current.reduce((s, d) => s + (d.directPathDistance || 0), 0)
+        / remoteEchoDataRef.current.length;
+      geometry.baselineDistance = avgBaseline;
+    }
+
+    // Broadcast geometry to recorder
+    link.send('geometry-update', { geometry });
+
+    const compiledResults = {
+      geometry,
+      modalPeaks: [],
+      interferenceResults: [],
+      responses: [],
+      ambientSpectrum: null,
+      noiseFloor: null,
+      latencyMs: null,
+      tracks,
+      echoHistory,
+      sweepTimestamps,
+      scanQuality: { label: tracks.length >= 5 ? 'Good' : tracks.length >= 3 ? 'Fair' : 'Poor', trackCount: tracks.length },
+      timestamp: new Date().toISOString(),
+      multiDevice: true,
+      baselineDistance: geometry.baselineDistance,
+    };
+
+    setResults(compiledResults);
+    setPhase('results');
+    setStatus(`Multi-device scan complete (${tracks.length} surfaces, baseline ${(geometry.baselineDistance || 0).toFixed(1)}m)`);
+  }, []);
+
+  const disconnectMultiDevice = useCallback(() => {
+    if (deviceLinkRef.current) deviceLinkRef.current.disconnect();
+    deviceLinkRef.current = null;
+    setMultiDevice({ active: false, connected: false, role: null, deviceCount: 0, roomCode: '', serverUrl: '', syncAccuracy: null, phase: 'idle' });
+  }, []);
+
+  const resetMapping = useCallback(() => {
+    stopProgressiveMapping();
+    if (engineRef.current) engineRef.current.dispose();
+    engineRef.current = null;
+    roomModelRef.current = null;
+    setPhase('idle');
+    setStatus('Tap MAP ROOM to begin');
+    setResults(null);
+    setWaveformData(null);
+    setError(null);
+    setWalkingStats({ steps: 0, distance: 0, coverage: 0, floorMaterial: null });
+  }, [stopProgressiveMapping]);
+
+  // Start progressive walking mode
+  const startProgressiveMapping = useCallback(() => {
+    if (!results || !engineRef.current) return;
+
+    // Seed room model from one-shot results
+    const model = new RoomModel();
+    model.initializeFromOneShot(results);
+    roomModelRef.current = model;
+
+    setPhase('walking-init');
+    setWalkingStats({
+      steps: 0,
+      distance: 0,
+      coverage: model.getCoveragePercentage(),
+      floorMaterial: null,
+    });
+  }, [results]);
+
+  // IMU permission result handler
+  const handleIMUPermission = useCallback((granted) => {
+    const engine = engineRef.current;
+    const model = roomModelRef.current;
+    if (!engine || !model) return;
+
+    // Start IMU tracking if granted
+    if (granted) {
+      const tracker = new IMUTracker();
+      tracker.hasPermission = true;
+      tracker.start(
+        // onStep
+        (stepData) => {
+          model.currentPosition = stepData.position;
+          model.addFootstep(stepData.position, model.floorMaterial, 0);
+          setWalkingStats(prev => ({
+            ...prev,
+            steps: stepData.stepCount,
+            distance: model.getDistanceWalked(),
+          }));
+        },
+        // onPositionUpdate
+        (pos) => {
+          model.currentPosition = pos;
+        }
+      );
+      imuTrackerRef.current = tracker;
+    }
+
+    // Start footstep detection — use IMU position if available, else model.currentPosition
+    const footstopStop = engine.startFootstepDetection(model.noiseFloor, (event) => {
+      const pos = imuTrackerRef.current
+        ? imuTrackerRef.current.getPosition()
+        : { ...model.currentPosition };
+      model.addFootstep(pos, event.floorMaterial, event.energy);
+      setWalkingStats(prev => ({
+        ...prev,
+        floorMaterial: event.floorMaterial,
+      }));
+    });
+    footstepStopRef.current = footstopStop;
+
+    // Start periodic mini-chirp bursts (recursive setTimeout to prevent overlap)
+    let chirpActive = true;
+    const scheduleBurst = async () => {
+      if (!chirpActive) return;
+      const eng = engineRef.current;
+      const mdl = roomModelRef.current;
+      if (!eng || !mdl) return;
+      setWalkingStatus('Emitting chirps...');
+      try {
+        const reflections = await eng.emitMiniChirpBurst(mdl.noiseFloor, setWalkingStatus);
+        if (!chirpActive) return; // check again after async
+        const pos = imuTrackerRef.current?.getPosition() || mdl.currentPosition;
+        mdl.addObservation(pos, reflections, 0.6);
+
+        // Try acoustic position fix
+        const fix = acousticPositionFix(reflections, mdl.geometry);
+        if (fix) {
+          if (imuTrackerRef.current) {
+            // Correct IMU drift
+            // Confidence from matched wall count: more walls matched = higher trust in fix
+            const fixConfidence = Math.min(1, reflections.length / 4); // 4+ reflections = full confidence
+            imuTrackerRef.current.correctPosition(fix, fixConfidence);
+          } else {
+            // No IMU — use acoustic fix directly as current position
+            mdl.currentPosition = fix;
+          }
+          mdl.addLandmark(fix, reflections.map(r => r.distance));
+        }
+
+        // Calibrate stride if IMU is active
+        if (imuTrackerRef.current && imuTrackerRef.current.stepCount > 8) {
+          const dist = mdl.getDistanceWalked();
+          imuTrackerRef.current.calibrateStride(dist, imuTrackerRef.current.stepCount);
+        }
+
+        // Run passive SSSG+DPF analysis on ambient audio between bursts
+        // Wait 200ms for chirp reverb to decay before recording ambient
+        if (!chirpActive) return;
+        await eng._wait(200);
+        try {
+          const passiveMapper = new PassiveAcousticMapper();
+          if (!chirpActive) return;
+          const ambientRec = await eng.recordAmbient(1.0, null, null);
+          const walkPositions = mdl.positionHistory.slice(-20).map(p => ({ x: p.x }));
+          const heading = imuTrackerRef.current?.heading || 0;
+          if (walkPositions.length >= 4) {
+            const passiveResult = passiveMapper.analyze(ambientRec, walkPositions, heading);
+            // Fuse passive dimensions with active geometry
+            if (passiveResult.dimensions.length > 0 && mdl.geometry) {
+              mdl.geometry = passiveMapper.fuseWithActiveResults(passiveResult, mdl.geometry);
+            }
+          }
+        } catch (pe) {
+          // Passive analysis is best-effort, don't break walking mode
+          console.warn('Passive SSSG analysis:', pe);
+        }
+
+        setWalkingStats(prev => ({
+          ...prev,
+          coverage: mdl.getCoveragePercentage(),
+        }));
+        setWalkingStatus(`${mdl.geometry?.walls?.length || 0} walls detected`);
+      } catch (e) {
+        console.warn('Mini chirp burst error:', e);
+        setWalkingStatus('Listening...');
+      }
+      // Schedule next burst only after current completes
+      if (chirpActive) {
+        const timerId = setTimeout(scheduleBurst, WALKING_BURST_INTERVAL_MS);
+        walkingIntervalsRef.current.push(timerId);
+      }
+    };
+    const firstTimer = setTimeout(scheduleBurst, WALKING_BURST_INTERVAL_MS);
+    walkingIntervalsRef.current.push(firstTimer);
+    // Store the deactivation flag for cleanup
+    walkingIntervalsRef.current._deactivate = () => { chirpActive = false; };
+
+    setPhase('walking');
+    setWalkingStatus('Walk around the room...');
+  }, []);
+
+  // Skip IMU, start walking with acoustic-only positioning
+  const handleIMUSkip = useCallback(() => {
+    handleIMUPermission(false);
+  }, [handleIMUPermission]);
+
+  // Stop progressive mapping
+  const stopProgressiveMapping = useCallback(() => {
+    // Deactivate recursive chirp scheduling
+    if (walkingIntervalsRef.current._deactivate) {
+      walkingIntervalsRef.current._deactivate();
+    }
+    // Clear all pending timeouts
+    walkingIntervalsRef.current.forEach(id => clearTimeout(id));
+    walkingIntervalsRef.current = [];
+
+    // Stop footstep detection
+    if (footstepStopRef.current) {
+      footstepStopRef.current();
+      footstepStopRef.current = null;
+    }
+
+    // Stop IMU
+    if (imuTrackerRef.current) {
+      imuTrackerRef.current.stop();
+      imuTrackerRef.current = null;
+    }
+
+    // Update results with enhanced model
+    if (roomModelRef.current) {
+      const model = roomModelRef.current;
+      setResults(prev => prev ? {
+        ...prev,
+        geometry: model.geometry || prev.geometry,
+        progressiveData: {
+          observations: model.observations.length,
+          totalSteps: model.totalSteps,
+          distanceWalked: model.getDistanceWalked(),
+          coverage: model.getCoveragePercentage(),
+          floorMaterial: model.floorMaterial,
+          footstepCount: model.footsteps.length,
+        },
+      } : prev);
+    }
+
+    setPhase('results');
+    setWalkingStatus('');
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (walkingIntervalsRef.current._deactivate) walkingIntervalsRef.current._deactivate();
+      walkingIntervalsRef.current.forEach(id => clearTimeout(id));
+      if (footstepStopRef.current) footstepStopRef.current();
+      if (imuTrackerRef.current) imuTrackerRef.current.stop();
+      if (engineRef.current) engineRef.current.dispose();
+    };
+  }, []);
+
+  const chartWidth = viewWidth;
+  const chartHeight = Math.round(viewWidth * 0.5);
+
+  return (
+    <div ref={containerRef} className="min-h-screen bg-[#0a0a0f] p-4 pb-20 max-w-lg mx-auto">
+      {/* Header */}
+      <div className="text-center mb-6 pt-2">
+        <h1 className="text-2xl font-bold text-beacon tracking-wider">ACOUSTIC MAPPER</h1>
+        <p className="text-gray-500 text-xs mt-1">Decibel Proximity Fencing</p>
+      </div>
+
+      {/* Error */}
+      {error && (
+        <div className="bg-danger/10 border border-danger/30 rounded-lg p-3 mb-4">
+          <p className="text-danger text-sm">{error}</p>
+        </div>
+      )}
+
+      {/* Status Pipeline */}
+      {phase !== 'idle' && <StatusPipeline phase={phase} />}
+
+      {/* Status Text */}
+      <div className="text-center mb-4">
+        <p className={`text-sm ${phase === 'idle' ? 'text-gray-500' : 'text-gray-300'}`}>
+          {status}
+        </p>
+        {latencyMs !== null && phase !== 'idle' && (
+          <p className="text-gray-600 text-xs mt-1">
+            Audio latency: {latencyMs.toFixed(1)} ms ({(latencyMs * SPEED_OF_SOUND / 2000).toFixed(2)} m offset)
+          </p>
+        )}
+      </div>
+
+      {/* Waveform */}
+      {phase !== 'idle' && phase !== 'results' && (
+        <div className="mb-4">
+          <WaveformCanvas
+            data={waveformData || new Float32Array(512)}
+            width={chartWidth}
+            height={100}
+            color="#00f5ff"
+          />
+        </div>
+      )}
+
+      {/* Mic permission pending */}
+      {phase === 'idle' && micPermission === null && (
+        <div className="flex justify-center mb-6">
+          <div className="w-48 h-48 rounded-full bg-surface border-2 border-beacon/30 flex items-center justify-center">
+            <div className="text-beacon text-sm animate-pulse">Requesting mic...</div>
+          </div>
+        </div>
+      )}
+
+      {/* MAP ROOM Button — only when mic granted */}
+      {phase === 'idle' && micPermission === true && (
+        <div className="flex justify-center mb-6">
+          <button
+            onClick={startMapping}
+            className="relative w-48 h-48 rounded-full bg-gradient-to-br from-beacon/20 to-beacon/5 border-2 border-beacon/50 flex items-center justify-center active:scale-95 transition-all duration-150 shadow-lg shadow-beacon/10"
+          >
+            <div className="absolute inset-2 rounded-full border border-beacon/20" />
+            <div className="absolute inset-4 rounded-full border border-beacon/10" />
+            <div className="text-center">
+              <div className="text-beacon text-xl font-bold tracking-widest">MAP</div>
+              <div className="text-beacon text-xl font-bold tracking-widest">ROOM</div>
+            </div>
+          </button>
+        </div>
+      )}
+
+      {/* Multi-Device Button + Pairing UI */}
+      {phase === 'idle' && micPermission === true && !multiDevice.active && (
+        <div className="text-center mb-4 space-x-2">
+          <button onClick={() => setMultiDevice(prev => ({ ...prev, active: true, phase: 'pairing' }))}
+            className="text-beacon/70 text-xs border border-beacon/20 px-4 py-2 rounded-lg active:scale-95 transition-transform">
+            Multi-Device Mode
+          </button>
+          <button onClick={() => {
+            // Play a slow 2-second sweep so the user can HEAR the frequency change
+            const ctx = new (window.AudioContext || window.webkitAudioContext)();
+            const slow = generateExponentialSweep(200, 8000, 2.0, ctx.sampleRate);
+            const buf = ctx.createBuffer(1, slow.length, ctx.sampleRate);
+            buf.getChannelData(0).set(slow);
+            const src = ctx.createBufferSource();
+            src.buffer = buf;
+            src.connect(ctx.destination);
+            src.start();
+          }}
+            className="text-gray-500 text-xs border border-gray-700 px-4 py-2 rounded-lg active:scale-95 transition-transform">
+            Test Sweep
+          </button>
+        </div>
+      )}
+
+      {/* Pairing Modal */}
+      {multiDevice.phase === 'pairing' && !multiDevice.connected && (
+        <div className="bg-surface rounded-xl p-4 border border-beacon/30 mb-4">
+          <h3 className="text-beacon font-bold text-sm mb-3">Multi-Device Pairing</h3>
+          <div className="space-y-2">
+            <input type="text" placeholder="Server IP (e.g. 192.168.1.5)"
+              className="w-full bg-surface-alt text-white text-sm px-3 py-2 rounded border border-gray-700"
+              value={multiDevice.serverUrl}
+              onChange={e => setMultiDevice(prev => ({ ...prev, serverUrl: e.target.value }))} />
+            <input type="text" placeholder="Room code (e.g. 1234)" maxLength="8"
+              className="w-full bg-surface-alt text-white text-sm px-3 py-2 rounded border border-gray-700"
+              value={multiDevice.roomCode}
+              onChange={e => setMultiDevice(prev => ({ ...prev, roomCode: e.target.value }))} />
+            <button onClick={() => {
+              const url = multiDevice.serverUrl.startsWith('ws') ? multiDevice.serverUrl : `ws://${multiDevice.serverUrl}:3333`;
+              startMultiDevice(url, multiDevice.roomCode);
+            }}
+              className="w-full bg-beacon/20 text-beacon border border-beacon/30 px-4 py-2 rounded-lg text-sm font-bold active:scale-95">
+              Join Room
+            </button>
+            <button onClick={() => setMultiDevice(prev => ({ ...prev, active: false, phase: 'idle' }))}
+              className="w-full text-gray-500 text-xs py-1">Cancel</button>
+          </div>
+        </div>
+      )}
+
+      {/* Multi-Device Status Banner */}
+      {multiDevice.connected && (
+        <div className="bg-surface rounded-lg p-3 mb-4 border border-beacon/20">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <div className={`w-2 h-2 rounded-full ${multiDevice.deviceCount >= 2 ? 'bg-success' : 'bg-warn animate-pulse'}`} />
+              <span className="text-xs text-gray-300">
+                Room {multiDevice.roomCode} · {multiDevice.deviceCount} device{multiDevice.deviceCount !== 1 ? 's' : ''}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-beacon font-bold">{multiDevice.role?.toUpperCase()}</span>
+              {multiDevice.syncAccuracy != null && (
+                <span className="text-xs text-gray-500">±{multiDevice.syncAccuracy.toFixed(1)}ms</span>
+              )}
+            </div>
+          </div>
+          {multiDevice.phase === 'ready' && multiDevice.role === 'emitter' && (
+            <button onClick={startMultiDeviceScan}
+              className="w-full mt-2 bg-beacon/20 text-beacon border border-beacon/30 px-4 py-2 rounded-lg text-sm font-bold active:scale-95">
+              Start Multi-Device Scan
+            </button>
+          )}
+          {multiDevice.phase === 'ready' && multiDevice.role === 'recorder' && (
+            <div className="mt-2 text-center text-gray-400 text-xs animate-pulse">
+              Waiting for emitter to start scan...
+            </div>
+          )}
+          <button onClick={disconnectMultiDevice}
+            className="w-full mt-1 text-gray-600 text-xs py-1">Disconnect</button>
+        </div>
+      )}
+
+      {/* Active mapping - disable button */}
+      {phase !== 'idle' && phase !== 'results' && phase !== 'walking-init' && phase !== 'walking' && (
+        <div className="flex justify-center mb-4">
+          <div className="w-32 h-32 rounded-full bg-surface border-2 border-beacon/30 flex items-center justify-center animate-pulse">
+            <div className="text-beacon text-sm font-bold">MAPPING...</div>
+          </div>
+        </div>
+      )}
+
+      {/* Walking Init - IMU permission prompt */}
+      {phase === 'walking-init' && (
+        <div className="mb-4">
+          <IMUPermissionPrompt onGranted={handleIMUPermission} onSkip={handleIMUSkip} />
+        </div>
+      )}
+
+      {/* Walking Mode - progressive mapping */}
+      {phase === 'walking' && roomModelRef.current && (
+        <WalkingModePanel
+          roomModel={roomModelRef.current}
+          walkingStats={walkingStats}
+          walkingStatus={walkingStatus}
+          onStop={stopProgressiveMapping}
+          chartWidth={chartWidth}
+          chartHeight={chartHeight}
+        />
+      )}
+
+      {/* Results */}
+      {phase === 'results' && results && (
+        <div className="space-y-4">
+          {/* Scan quality warning */}
+          {results.geometry?.insufficientData && (
+            <div className="bg-warn/10 border border-warn/30 rounded-lg p-3 mb-2">
+              <p className="text-warn text-sm font-bold">Insufficient echo data</p>
+              <p className="text-gray-400 text-xs mt-1">Fewer than 4 surfaces detected. Try scanning in a quieter room, or hold the phone steady at arm's length.</p>
+            </div>
+          )}
+          {results.geometry?.solverFailed && !results.geometry?.insufficientData && (
+            <div className="bg-danger/10 border border-danger/30 rounded-lg p-3 mb-2">
+              <p className="text-danger text-sm font-bold">Geometry solver did not converge</p>
+              <p className="text-gray-400 text-xs mt-1">Dimensions shown may be inaccurate. Try rescanning with the device held steady.</p>
+            </div>
+          )}
+
+          {/* Scan Quality */}
+          {results.scanQuality && (() => {
+            const sq = results.scanQuality;
+            const isGood = sq.label === 'Good';
+            const isFair = sq.label === 'Fair';
+            const badgeColor = isGood ? 'text-success border-success/40 bg-success/10'
+              : isFair ? 'text-warn border-warn/40 bg-warn/10'
+              : 'text-danger border-danger/40 bg-danger/10';
+            const badgeText = isGood ? 'Good'
+              : isFair ? 'Fair'
+              : 'Poor \u2014 try a quieter room';
+            return (
+              <div className="bg-surface rounded-xl p-4 border border-gray-800">
+                <div className="flex items-center gap-3 mb-2">
+                  <h3 className="text-beacon font-bold text-sm">Scan Quality</h3>
+                  <span className={`text-xs font-bold px-2 py-0.5 rounded-full border ${badgeColor}`}>
+                    {badgeText}
+                  </span>
+                </div>
+                <div className="space-y-1">
+                  <p className="text-gray-400 text-xs">
+                    {sq.trackCount} surface{sq.trackCount !== 1 ? 's' : ''} detected
+                    {sq.multiPathFiltered > 0 ? ` (${sq.multiPathFiltered} multi-path filtered)` : ''}
+                  </p>
+                  <p className="text-gray-400 text-xs">
+                    Avg {sq.avgDetectionsPerTrack.toFixed(1)} detections per surface out of {sq.usableSweeps} sweeps
+                  </p>
+                  {results.latencyMs != null && (
+                    <p className="text-gray-400 text-xs">
+                      Latency: {results.latencyMs.toFixed(1)} ms
+                    </p>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Temperature */}
+          <div className="flex items-center gap-2 mb-1">
+            <label className="text-gray-400 text-xs">Room temp (°C)</label>
+            <input
+              type="number"
+              value={roomTempC}
+              onChange={e => setRoomTempC(Number(e.target.value))}
+              className="bg-surface-alt text-white text-xs rounded w-16 px-2 py-1 border border-gray-700 text-center"
+            />
+          </div>
+
+          {/* Dimensions */}
+          <div className="bg-surface rounded-xl p-4 border border-gray-800">
+            <h3 className="text-beacon font-bold text-sm mb-3">Room Dimensions</h3>
+            <div className="grid grid-cols-3 gap-3 text-center">
+              {['x', 'y', 'z'].map(axis => {
+                const val = results.geometry[axis];
+                const conf = results.geometry.confidence?.[axis] || 0;
+                return (
+                  <div key={axis} className="bg-surface-alt rounded-lg p-3">
+                    <div className="text-gray-500 text-xs mb-1">{axis === 'z' ? 'Height' : axis === 'x' ? 'Width' : 'Depth'}</div>
+                    <div className="text-white text-xl font-bold">
+                      {val ? `${val.toFixed(1)}m` : '--'}
+                    </div>
+                    <div className="text-gray-600 text-xs mt-1">
+                      {conf > 0 ? `${(conf * 100).toFixed(0)}% conf` : ''}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            {results.geometry.modalAgreement != null && (
+              <div className="mt-3 text-center">
+                <span className="text-gray-500 text-xs">Modal agreement: </span>
+                <span className={`text-xs font-bold ${
+                  results.geometry.modalAgreement > 0.6 ? 'text-success' :
+                  results.geometry.modalAgreement > 0.3 ? 'text-warn' : 'text-danger'
+                }`}>
+                  {(results.geometry.modalAgreement * 100).toFixed(0)}%
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Floor Plan */}
+          <div className="bg-surface rounded-xl p-4 border border-gray-800">
+            <h3 className="text-beacon font-bold text-sm mb-3">Floor Plan</h3>
+            <FloorPlan geometry={results.geometry} width={chartWidth - 32} height={chartHeight} />
+          </div>
+
+          {/* Surface Materials */}
+          {results.geometry.walls?.length > 0 && (
+            <div className="bg-surface rounded-xl p-4 border border-gray-800">
+              <h3 className="text-beacon font-bold text-sm mb-3">Detected Surfaces</h3>
+              <p className="text-gray-600 text-xs italic mb-2">Material classification is experimental</p>
+              <div className="space-y-2">
+                {results.geometry.walls.map((w, i) => (
+                  <div key={i} className="flex items-center gap-3 text-xs">
+                    <div className="w-3 h-3 rounded-full flex-shrink-0"
+                      style={{ backgroundColor: w.material?.color || '#888' }} />
+                    <span className="text-gray-300 flex-1">{w.material?.label || 'Unknown'}</span>
+                    <span className="text-gray-500">{(w.distance ?? 0).toFixed(2)}m</span>
+                    <span className="text-gray-600">({w.reflectionCount} hits)</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Objects */}
+          {results.geometry.objects?.length > 0 && (
+            <div className="bg-surface rounded-xl p-4 border border-gray-800">
+              <h3 className="text-beacon font-bold text-sm mb-3">Detected Objects</h3>
+              <div className="space-y-2">
+                {results.geometry.objects.map((obj, i) => (
+                  <div key={i} className="flex items-center gap-3 text-xs">
+                    <div className="w-3 h-3 rounded-sm flex-shrink-0"
+                      style={{ backgroundColor: obj.material?.color || '#888' }} />
+                    <span className="text-gray-300 flex-1">{obj.material?.label || 'Unknown'}</span>
+                    <span className="text-gray-500">{obj.distance.toFixed(2)}m</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Spectral Response */}
+          <div className="bg-surface rounded-xl p-4 border border-gray-800">
+            <h3 className="text-beacon font-bold text-sm mb-3">Spectral Response</h3>
+            <SpectralChart responses={results.responses} width={chartWidth - 32} height={chartHeight} />
+          </div>
+
+          {/* Modal Frequencies */}
+          <div className="bg-surface rounded-xl p-4 border border-gray-800">
+            <h3 className="text-beacon font-bold text-sm mb-3">Room Modes</h3>
+            <ModalChart
+              detectedModes={results.geometry.detectedModes}
+              predictedModes={results.geometry.predictedModes}
+              width={chartWidth - 32}
+              height={Math.round(chartHeight * 0.6)}
+            />
+            {results.modalPeaks?.length > 0 && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {results.modalPeaks.slice(0, 10).map((p, i) => (
+                  <span key={i} className="text-xs bg-surface-alt px-2 py-0.5 rounded text-gray-400">
+                    {p.frequency.toFixed(0)} Hz
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Interference Results */}
+          {results.interferenceResults?.length > 0 && (
+            <div className="bg-surface rounded-xl p-4 border border-gray-800">
+              <h3 className="text-beacon font-bold text-sm mb-3">Interference Analysis</h3>
+              <div className="space-y-2">
+                {results.interferenceResults.map((ir, i) => (
+                  <div key={i} className="bg-surface-alt rounded-lg p-2">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-gray-300">{ir.frequency.toFixed(0)} Hz</span>
+                      <span className="text-gray-500">Q: {ir.qFactor.toFixed(1)}</span>
+                    </div>
+                    <div className="flex gap-2 mt-1">
+                      <div className="flex-1">
+                        <div className="text-xs text-success/70 mb-0.5">Constructive</div>
+                        <div className="h-2 bg-surface rounded-full overflow-hidden">
+                          <div className="h-full bg-success/50 rounded-full"
+                            style={{ width: `${Math.min(100, ir.gainRatio * 20)}%` }} />
+                        </div>
+                      </div>
+                      <div className="flex-1">
+                        <div className="text-xs text-danger/70 mb-0.5">Cancellation</div>
+                        <div className="h-2 bg-surface rounded-full overflow-hidden">
+                          <div className="h-full bg-danger/50 rounded-full"
+                            style={{ width: `${Math.min(100, Math.abs(ir.cancellationDb) * 3)}%` }} />
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Voice Proximity */}
+          <VoiceProximityPanel
+            engine={engineRef.current}
+            roomGeometry={results.geometry}
+            isActive={phase === 'results'}
+          />
+
+          {/* Progressive data summary (if walking was done) */}
+          {results.progressiveData && (
+            <div className="bg-surface rounded-xl p-4 border border-beacon/20">
+              <h3 className="text-beacon font-bold text-sm mb-3">Walking Mode Results</h3>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-surface-alt rounded-lg p-2 text-center">
+                  <div className="text-white text-lg font-bold">{results.progressiveData.observations}</div>
+                  <div className="text-gray-500 text-xs">Observations</div>
+                </div>
+                <div className="bg-surface-alt rounded-lg p-2 text-center">
+                  <div className="text-white text-lg font-bold">{results.progressiveData.totalSteps}</div>
+                  <div className="text-gray-500 text-xs">Steps</div>
+                </div>
+                <div className="bg-surface-alt rounded-lg p-2 text-center">
+                  <div className="text-white text-lg font-bold">{results.progressiveData.distanceWalked.toFixed(1)}m</div>
+                  <div className="text-gray-500 text-xs">Walked</div>
+                </div>
+                <div className="bg-surface-alt rounded-lg p-2 text-center">
+                  <div className="text-success text-lg font-bold">{results.progressiveData.coverage.toFixed(0)}%</div>
+                  <div className="text-gray-500 text-xs">Coverage</div>
+                </div>
+              </div>
+              {results.progressiveData.floorMaterial && (
+                <div className="mt-2 flex items-center gap-2 text-xs">
+                  <div className="w-3 h-3 rounded-full" style={{ backgroundColor: results.progressiveData.floorMaterial.color }} />
+                  <span className="text-gray-300">Floor: {results.progressiveData.floorMaterial.label}</span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Start Walking Button */}
+          <button onClick={startProgressiveMapping}
+            className="w-full bg-beacon/20 text-beacon border border-beacon/30 px-4 py-3 rounded-lg text-sm font-bold active:scale-95 transition-transform mt-2">
+            {results.progressiveData ? 'Walk More to Refine' : 'Start Walking to Map More'}
+          </button>
+
+          {/* Reset Button */}
+          <button onClick={resetMapping}
+            className="w-full bg-surface-alt border border-gray-700 text-gray-300 px-4 py-3 rounded-lg text-sm font-medium active:scale-95 transition-transform mt-2">
+            Map Again
+          </button>
+        </div>
+      )}
+
+      {/* Mic permission info */}
+      {micPermission === false && (
+        <div className="bg-surface rounded-xl p-4 border border-danger/30 mt-4">
+          <h3 className="text-danger font-bold text-sm mb-2">Microphone Access Required</h3>
+          <p className="text-gray-400 text-xs">
+            This tool uses your phone's microphone and speaker to map your room acoustically.
+            No audio data leaves your device — all processing happens locally in your browser.
+          </p>
+          <button onClick={startMapping}
+            className="mt-3 bg-beacon/20 text-beacon px-4 py-2 rounded-lg text-sm w-full active:scale-95 transition-transform">
+            Try Again
+          </button>
+        </div>
+      )}
+
+      {/* Footer */}
+      {phase !== 'walking' && (
+        <div className="text-center mt-8 text-gray-500 text-xs">
+          <p>Acoustic Room Mapper v2.0</p>
+          <p className="mt-0.5">All processing runs locally on your device</p>
+        </div>
+      )}
+
+      {/* Sticky Finish Walking button — always visible during walking */}
+      {phase === 'walking' && (
+        <div className="fixed bottom-0 left-0 right-0 p-4 bg-[#0a0a0f]/90 backdrop-blur border-t border-gray-800 z-50">
+          <button onClick={stopProgressiveMapping}
+            className="w-full bg-warn text-black font-bold py-4 rounded-xl text-base active:scale-95 transition-transform max-w-lg mx-auto block">
+            Finish Walking
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Mount
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+</script>
+</body>
+</html>
